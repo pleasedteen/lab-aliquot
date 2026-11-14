@@ -214,6 +214,7 @@ async function render() {
     split: renderSplit,
     retire: renderRetire,
     recall: renderRecall,
+    reverse: renderReverse,
     trace: renderTrace,
     history: renderHistory,
   };
@@ -927,7 +928,7 @@ function renderRecall() {
                       h("td", { class: "mono" }, a.code),
                       h("td", { class: "num" }, a.remaining_display),
                       h("td", { class: "small" }, compositionText(a.composition)),
-                      h("td", {}, h("span", { class: "badge neutral" }, a.current_status === "available" ? "仍在库" : a.current_status === "retired" ? "已报废" : a.current_status === "exhausted" ? "已用尽" : a.current_status)),
+                      h("td", {}, h("span", { class: "badge neutral" }, a.current_status === "available" ? "仍在库" : a.current_status === "retired" ? "已报废" : a.current_status === "exhausted" ? "已用尽" : a.current_status === "voided" ? "已冲销失效" : a.current_status)),
                       h("td", { class: "num" }, a.current_remaining_display ?? "—")
                     )))
                 )
@@ -938,6 +939,187 @@ function renderRecall() {
   );
 
   return h("div", {}, form, history);
+}
+
+// ------------------------------------------------------------------ 冲销更正
+
+function openReverse(opId) {
+  state.reverseOp = opId;
+  state.tab = "reverse";
+  $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === "reverse"));
+  render();
+}
+
+function renderReverse() {
+  const opInput = h("input", {
+    type: "number",
+    min: "1",
+    step: "1",
+    placeholder: "输入要冲销的分装操作号，例如 3",
+  });
+  const note = h("textarea", { placeholder: "可选：冲销原因，例如“分装量录错，实际未执行”…" });
+  const previewBox = h("div", {});
+  let preview = null;
+  let busy = false;
+
+  async function runPreview() {
+    const raw = opInput.value.trim();
+    preview = null;
+    if (!raw) {
+      previewBox.replaceChildren(
+        h("div", { class: "empty" }, "输入操作序号后会自动预览影响；确认前不会改动任何数据。")
+      );
+      return;
+    }
+    previewBox.replaceChildren(h("div", { class: "loading" }, "正在计算影响…"));
+    try {
+      preview = await api(`/api/reverse/preview?op=${encodeURIComponent(raw)}`);
+    } catch (err) {
+      previewBox.replaceChildren(
+        h("div", { class: "alert error" },
+          err.message,
+          (err.details || []).length
+            ? h("ul", {}, err.details.map((d) => h("li", {}, d)))
+            : null)
+      );
+      return;
+    }
+    drawPreview();
+  }
+
+  function opLine(op) {
+    const ins = (op.inputs || []).map((i) => `${i.code} ${i.amount_display} µL`).join("、");
+    const outs = (op.outputs || []).map((o) => `${o.code} ${o.amount_display} µL`).join("、");
+    return `#${op.id}（${fmtTime(op.created_at)}）：取 ${ins || "—"} → 分 ${outs || "—"}`;
+  }
+
+  function drawPreview() {
+    const p = preview;
+    const confirmBtn = h(
+      "button",
+      { class: "btn danger", disabled: !p.ok || busy, onclick: doReverse },
+      p.ok ? "确认整批冲销" : "存在问题，无法冲销"
+    );
+    previewBox.replaceChildren(
+      h("div", { class: "panel", style: "background:#fbfcfe" },
+        h("div", { class: "panel-head" },
+          h("h2", {}, `影响预览：冲销分装操作 #${p.root_op}`),
+          h("span", { class: "hint" }, `基于操作 #${p.latest_seq} 的库存计算`)
+        ),
+        p.problems.length
+          ? h("div", { class: "alert error" },
+              h("strong", {}, "存在阻止冲销的问题："),
+              h("ul", {}, p.problems.map((d) => h("li", {}, d))))
+          : h("div", { class: "alert info" },
+              `将整单作废 ${p.void_ops.length} 笔分装` +
+              (p.void_retire_items.length ? `、作废 ${p.void_retire_items.length} 条报废明细` : "") +
+              `；${p.doomed_tubes.length} 支管将视为从未存在；` +
+              `误扣用量退回 ${p.refunds.length} 支仍有效的原管。其他操作与已发召回不受影响。`),
+        h("div", { class: "section-title" }, "退回用量（退回仍有效的原管）"),
+        p.refunds.length
+          ? h("table", { class: "mini-table" },
+              h("thead", {}, h("tr", {},
+                h("th", {}, "原管"), h("th", { class: "num" }, "退回 µL"),
+                h("th", { class: "num" }, "剩余（前 → 后）"), h("th", {}, "退回后状态"))),
+              h("tbody", {}, p.refunds.map((r) =>
+                h("tr", {},
+                  h("td", { class: "mono" }, r.code),
+                  h("td", { class: "num" }, `+${r.amount_display}`),
+                  h("td", { class: "num" }, `${r.remaining_before_display} → ${r.remaining_after_display}`),
+                  h("td", {}, r.recalled
+                    ? h("span", { class: "badge danger" }, `召回中（${r.recall_batches.join("、")}），退回后仍禁取样`)
+                    : h("span", { class: "badge ok" }, "可用"))))))
+          : h("p", { class: "muted small" }, "没有需要退回的用量。"),
+        h("div", { class: "section-title" }, "将整单作废的分装操作"),
+        h("div", { class: "stack" }, p.void_ops.map((op) =>
+          h("div", { class: "small" }, "• " + opLine(op)))),
+        p.void_retire_items.length
+          ? h("div", {},
+              h("div", { class: "section-title" }, "将作废的报废明细（同单其他管不受影响）"),
+              h("div", { class: "stack" }, p.void_retire_items.map((r) =>
+                h("div", { class: "small" }, `• 报废操作 #${r.op_id} 中的 ${r.code}（当时废弃 ${r.discarded_display} µL）`))))
+          : null,
+        h("div", { class: "section-title" }, "将视为从未存在的管"),
+        p.doomed_tubes.length
+          ? h("table", { class: "mini-table" },
+              h("thead", {}, h("tr", {},
+                h("th", {}, "编号"), h("th", { class: "num" }, "初始 µL"),
+                h("th", { class: "num" }, "当前剩余 µL"), h("th", {}, "建立于"))),
+              h("tbody", {}, p.doomed_tubes.map((t) =>
+                h("tr", {},
+                  h("td", { class: "mono" }, t.code),
+                  h("td", { class: "num" }, t.initial_volume_display),
+                  h("td", { class: "num" }, t.remaining_display),
+                  h("td", {}, `操作 #${t.created_op}`)))))
+          : h("p", { class: "muted small" }, "无。"),
+        h("label", { class: "field", style: "margin-top:12px" }, h("span", {}, "冲销备注"), note),
+        h("div", { class: "row", style: "align-items:center" },
+          h("span", { class: "muted small" },
+            "提交后原操作保留并标注“已冲销”，可随时按序号回看冲销前的账；" +
+            "提交前若相关库存有变动需重新预览确认；重复提交不会重复退回。"),
+          h("div", { class: "shrink" }, confirmBtn))
+      )
+    );
+  }
+
+  async function doReverse() {
+    if (!preview || busy) return;
+    busy = true;
+    drawPreview();
+    try {
+      const result = await api("/api/reverse", {
+        method: "POST",
+        body: { op: preview.root_op, token: preview.token, note: note.value },
+      });
+      const rev = result.reversal;
+      toast(
+        `冲销完成（操作 #${result.operation.id}）：作废 ${rev.void_ops.length} 笔分装，` +
+        `退回 ${rev.refunds.map((r) => `${r.code} +${r.amount_display} µL`).join("、") || "无"}`
+      );
+      state.reverseOp = null;
+      await render();
+    } catch (err) {
+      if (err.status === 409) {
+        // 预览之后相关库存有变动：强制重新预览确认
+        showError(err, "库存已变动，请重新确认下面的最新影响");
+        busy = false;
+        await runPreview();
+        return;
+      }
+      showError(err, "冲销未提交");
+      busy = false;
+      drawPreview();
+    }
+  }
+
+  opInput.addEventListener("change", runPreview);
+  const previewBtn = h("button", { class: "btn", type: "button", onclick: runPreview }, "预览影响");
+
+  const form = h("div", { class: "panel" },
+    h("div", { class: "panel-head" },
+      h("h2", {}, "冲销误录的分装"),
+      h("p", { class: "hint" },
+        "整批作废这笔分装和依赖它的后续混样、报废；误扣的用量退回仍有效的原管，其他取样照旧。" +
+        "已发的召回继续有效，退回召回管的量也不能取用。")
+    ),
+    h("div", { class: "row" },
+      h("div", { style: "flex:2" },
+        h("label", { class: "field", style: "margin:0" },
+          h("span", {}, "分装操作号 ", h("span", { class: "req" }, "*")), opInput)),
+      h("div", { class: "shrink" }, previewBtn)
+    )
+  );
+
+  previewBox.replaceChildren(
+    h("div", { class: "empty" }, "输入操作序号后会自动预览影响；确认前不会改动任何数据。")
+  );
+  if (state.reverseOp != null) {
+    opInput.value = String(state.reverseOp);
+    state.reverseOp = null;
+    runPreview();
+  }
+
+  return h("div", {}, form, previewBox);
 }
 
 // ------------------------------------------------------------------ 追溯
@@ -1059,7 +1241,8 @@ function renderTubeTrace(data) {
         data.used_in.length
           ? h("ul", { class: "timeline" }, data.used_in.map((u) =>
               h("li", {},
-                h("div", {}, h("strong", {}, `操作 #${u.op_id}`), " ", h("span", { class: "badge neutral" }, u.kind === "split" ? "取样/分装" : u.kind === "retire" ? "报废" : u.kind)),
+                h("div", {}, h("strong", {}, `操作 #${u.op_id}`), " ", h("span", { class: "badge neutral" }, u.kind === "split" ? "取样/分装" : u.kind === "retire" ? "报废" : u.kind),
+                  u.voided_by ? h("span", { class: "badge danger" }, `已冲销 #${u.voided_by}`) : null),
                 h("div", { class: "small muted" }, `${fmtTime(u.created_at)} · 取用 ${u.amount_display} µL`),
                 u.outputs.length
                   ? h("div", { class: "small" }, "→ " + u.outputs.map((o) => `${o.code}（${o.amount_display} µL）`).join("、"))
@@ -1144,6 +1327,7 @@ function OperationCard(op) {
     split: ["info", "取样 / 分装"],
     retire: ["warn", "报废"],
     recall: ["danger", "召回"],
+    reverse: ["warn", "冲销"],
   }[op.kind] || ["neutral", op.kind];
   const [cls, label] = kindLabel;
 
@@ -1181,15 +1365,56 @@ function OperationCard(op) {
       )
     : null;
 
-  return h("div", { class: "line-editor", style: "background:#fff" },
+  const reversalBlock = op.reversal
+    ? h("div", { style: "margin:8px 0" },
+        h("div", { class: "section-title", style: "margin-top:4px" },
+          `冲销明细（目标：分装操作 #${op.reversal.root_op}）`),
+        h("table", { class: "mini-table" },
+          h("thead", {}, h("tr", {},
+            h("th", {}, "整单作废的操作"), h("th", {}, "取样"), h("th", {}, "分装成品"))),
+          h("tbody", {}, op.reversal.void_ops.map((v) =>
+            h("tr", {},
+              h("td", {}, `#${v.op_id}`),
+              h("td", { class: "small" }, v.inputs.length
+                ? v.inputs.map((i) => `${i.code} ${i.amount_display} µL`).join("、")
+                : "—"),
+              h("td", { class: "small" }, v.outputs.length
+                ? v.outputs.map((o) => `${o.code} ${o.amount_display} µL`).join("、")
+                : "—"))))),
+        op.reversal.void_retire_items.length
+          ? h("p", { class: "small" },
+              "作废的报废明细：" +
+              op.reversal.void_retire_items
+                .map((r) => `操作 #${r.op_id} 的 ${r.code}（废弃 ${r.discarded_display} µL）`)
+                .join("；"))
+          : null,
+        h("p", { class: "small" },
+          "退回用量：" +
+          (op.reversal.refunds.length
+            ? op.reversal.refunds.map((r) => `${r.code} +${r.amount_display} µL`).join("、")
+            : "无")))
+    : null;
+
+  return h("div", { class: "line-editor" + (op.voided_by ? " voided" : ""), style: "background:#fff" },
     h("div", { class: "row", style: "align-items:baseline" },
       h("strong", {}, `#${op.id}`),
       h("span", { class: `badge ${cls}` }, label),
+      op.voided_by
+        ? h("span", { class: "badge danger", title: "该操作已随冲销作废，不再影响库存" },
+            `已被冲销 #${op.voided_by}`)
+        : null,
       h("span", { class: "muted small" }, fmtTime(op.created_at)),
       op.kind === "split"
         ? h("span", { class: "small muted" }, `取样 ${op.total_in_display} µL = 分装 ${op.total_out_display} µL`)
         : null,
       h("span", { style: "flex:1" }),
+      op.kind === "split" && !op.voided_by
+        ? h("button", {
+            class: "btn ghost danger small",
+            title: "整批冲销这笔分装和依赖它的后续操作",
+            onclick: () => openReverse(op.id),
+          }, "冲销…")
+        : null,
       h("button", {
         class: "btn ghost small",
         onclick: () => {
@@ -1204,7 +1429,10 @@ function OperationCard(op) {
     ),
     op.note ? h("p", { class: "small muted", style: "margin:4px 0" }, op.note) : null,
     op.retired && op.retired.length
-      ? h("p", { class: "small" }, "报废：" + op.retired.map((r) => `${r.code}（废弃 ${r.discarded_display} µL）`).join("、"))
+      ? h("p", { class: "small" }, "报废：" + op.retired.map((r) =>
+          `${r.code}（废弃 ${r.discarded_display} µL）` +
+          (r.voided_by ? `［已随冲销 #${r.voided_by} 作废］` : "")
+        ).join("、"))
       : null,
     op.recall
       ? h("p", { class: "small" },
@@ -1213,6 +1441,7 @@ function OperationCard(op) {
             ? op.recall.affected.map((a) => `${a.code}（剩 ${a.remaining_display} µL）`).join("、")
             : "无"))
       : null,
+    reversalBlock,
     inputList,
     outputList
   );

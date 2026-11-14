@@ -191,6 +191,8 @@ textarea { resize: vertical; min-height: 64px; }
 .row > .shrink { flex: 0 0 auto; }
 
 .line-editor { border: 1px solid var(--line); border-radius: 8px; padding: 10px; margin-bottom: 10px; background: #fbfcfe; }
+.line-editor.voided { opacity: 0.72; border-style: dashed; }
+.line-editor.voided > .row:first-child > strong { text-decoration: line-through; }
 .line-editor .row { gap: 8px; }
 .line-editor .del { flex: 0 0 auto; }
 .mini-table th, .mini-table td { padding: 6px 8px; }

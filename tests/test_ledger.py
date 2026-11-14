@@ -11,6 +11,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from fractions import Fraction
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -341,6 +342,400 @@ class TestTraceAndRecall(LedgerCase):
             self.L.retire(["M1", "NOPE"])
         self.assertEqual(self.tubes()["M1"]["status"], "available")
         self.assertEqual(self.L.inventory()["counts"]["retired"], 0)
+
+
+class TestReversal(LedgerCase):
+    """冲销：整批作废误录的分装及依赖它的后续操作，误扣用量退回原管。"""
+
+    def build_chain(self):
+        """A --100--> S1 --60--> S2；另有一支无关的 B。"""
+        self.L.register_intake("A", "LOT-A", "1000")
+        self.L.register_intake("B", "LOT-B", "500")
+        self.L.split([{"tube": "A", "amount": "100"}], [{"code": "S1", "amount": "100"}])
+        self.L.split([{"tube": "S1", "amount": "60"}], [{"code": "S2", "amount": "60"}])
+
+    def reverse(self, op, note=""):
+        token = self.L.reverse_preview(op)["token"]
+        return self.L.reverse(op, token, note)
+
+    def test_preview_is_read_only(self):
+        self.build_chain()
+        before = self.L.inventory()
+        preview = self.L.reverse_preview(3)
+        after = self.L.inventory()
+        self.assertEqual(before["latest_seq"], after["latest_seq"])
+        self.assertEqual(preview["root_op"], 3)
+        self.assertTrue(preview["ok"])
+        self.assertEqual([op["id"] for op in preview["void_ops"]], [3, 4])
+        self.assertEqual([t["code"] for t in preview["doomed_tubes"]], ["S1", "S2"])
+        self.assertEqual(len(preview["refunds"]), 1)
+        self.assertEqual(preview["refunds"][0]["code"], "A")
+        self.assertEqual(preview["refunds"][0]["amount"], "100")
+        self.assertEqual(preview["refunds"][0]["remaining_after"], "1000")
+
+    def test_reverse_cascades_and_refunds_source_once(self):
+        self.build_chain()
+        result = self.reverse(3, "分装录错")
+        rev = result["reversal"]
+        self.assertEqual(rev["root_op"], 3)
+        self.assertEqual([v["op_id"] for v in rev["void_ops"]], [3, 4])
+        # S1→S2 的 60 µL 属于被作废链条内部倒手，不退；只退 A 被误扣的 100
+        self.assertEqual([(r["code"], r["amount"]) for r in rev["refunds"]], [("A", "100")])
+        tubes = self.tubes()
+        self.assertNotIn("S1", tubes)
+        self.assertNotIn("S2", tubes)
+        self.assertEqual(tubes["A"]["remaining"], "1000")
+        self.assertEqual(tubes["A"]["status"], "available")
+        # 无关的 B 照旧
+        self.assertEqual(tubes["B"]["remaining"], "500")
+
+    def test_history_keeps_pre_reversal_accounts(self):
+        self.build_chain()
+        self.reverse(3)
+        # 当前账：A 已退回，S1/S2 不存在
+        self.assertEqual(self.tubes()["A"]["remaining"], "1000")
+        # 回看冲销前的账：操作 3 完成时 A=900、S1 在库 100；操作 4 完成时 S1=40、S2 在库
+        snap3 = self.L.state_at(3)
+        by_code = {t["code"]: t for t in snap3["tubes"]}
+        self.assertEqual(by_code["A"]["remaining"], "900")
+        self.assertEqual(by_code["S1"]["remaining"], "100")
+        snap4 = self.L.state_at(4)
+        by_code4 = {t["code"]: t for t in snap4["tubes"]}
+        self.assertEqual(by_code4["S1"]["remaining"], "40")
+        self.assertIn("S2", by_code4)
+        # 历史里三笔操作都在，被冲销的标注 voided_by，冲销操作自带明细
+        hist = self.L.history()["operations"]
+        self.assertEqual([op["kind"] for op in hist], ["intake", "intake", "split", "split", "reverse"])
+        self.assertEqual(hist[2]["voided_by"], 5)
+        self.assertEqual(hist[3]["voided_by"], 5)
+        self.assertIsNone(hist[4]["voided_by"])
+        self.assertEqual(hist[4]["reversal"]["root_op"], 3)
+        # 冲销前的单管追溯也能回看
+        past = self.L.tube_trace("S1", seq=3)
+        self.assertEqual(past["tube"]["remaining"], "100")
+
+    def test_voided_tube_cannot_be_used(self):
+        self.build_chain()
+        self.reverse(3)
+        with self.assertRaises(NotFoundError) as ctx:
+            self.L.tube_trace("S1")
+        self.assertIn("冲销", str(ctx.exception.message))
+        with self.assertRaises(LedgerError) as ctx:
+            self.L.split([{"tube": "S1", "amount": "1"}], [{"code": "Z", "amount": "1"}])
+        self.assertIn("已被冲销", " ".join(ctx.exception.details))
+        with self.assertRaises(LedgerError) as ctx:
+            self.L.retire(["S1"])
+        self.assertIn("已被冲销", " ".join(ctx.exception.details))
+
+    def test_retire_item_on_doomed_tube_voided_but_others_stay(self):
+        self.build_chain()
+        self.L.retire(["S2", "B"], "一起报废")  # 操作 5：同一单报废两管
+        result = self.reverse(3)
+        rev = result["reversal"]
+        self.assertEqual([(i["op_id"], i["code"]) for i in rev["void_retire_items"]], [(5, "S2")])
+        tubes = self.tubes()
+        self.assertNotIn("S2", tubes)
+        # 同一报废单里的 B 不受影响，仍是已报废
+        self.assertEqual(tubes["B"]["status"], "retired")
+        self.assertEqual(tubes["B"]["retired_op"], 5)
+        # 报废操作本身仍在，只有 S2 那条明细被作废
+        op5 = self.L.operation_detail(5)
+        by_code = {r["code"]: r for r in op5["retired"]}
+        self.assertEqual(by_code["S2"]["voided_by"], 6)
+        self.assertIsNone(by_code["B"]["voided_by"])
+
+    def test_independent_splits_untouched(self):
+        self.build_chain()
+        self.L.split([{"tube": "B", "amount": "50"}], [{"code": "T1", "amount": "50"}])
+        self.reverse(3)
+        tubes = self.tubes()
+        self.assertEqual(tubes["B"]["remaining"], "450")
+        self.assertEqual(tubes["T1"]["remaining"], "50")
+
+    def test_exhausted_source_becomes_available_again(self):
+        self.L.register_intake("A", "LOT-A", "100")
+        self.L.split([{"tube": "A", "amount": "60"}], [{"code": "S1", "amount": "60"}])
+        self.L.split([{"tube": "A", "amount": "40"}], [{"code": "S2", "amount": "40"}])
+        self.assertEqual(self.tubes()["A"]["status"], "exhausted")
+        self.reverse(2)
+        a = self.tubes()["A"]
+        self.assertEqual(a["remaining"], "60")
+        self.assertEqual(a["status"], "available")
+        self.assertEqual(self.tubes()["S2"]["remaining"], "40")
+
+    def test_blocked_when_refund_source_retired(self):
+        self.build_chain()
+        self.L.retire(["A"], "原管废弃")
+        preview = self.L.reverse_preview(3)
+        self.assertFalse(preview["ok"])
+        self.assertIn("已报废", " ".join(preview["problems"]))
+        with self.assertRaises(LedgerError) as ctx:
+            self.reverse(3)
+        self.assertIn("已报废", " ".join(ctx.exception.details))
+        # 整笔拒绝：账目不变
+        tubes = self.tubes()
+        self.assertEqual(tubes["A"]["remaining"], "900")
+        self.assertEqual(tubes["A"]["status"], "retired")
+        self.assertIn("S1", tubes)
+        self.assertEqual(self.L.inventory()["latest_seq"], 5)
+
+    def test_refund_to_recalled_source_stays_blocked(self):
+        self.build_chain()
+        self.L.recall("LOT-A", "来样异常")  # 操作 5
+        preview = self.L.reverse_preview(3)
+        self.assertTrue(preview["ok"])  # 召回不阻止冲销
+        refund = preview["refunds"][0]
+        self.assertTrue(refund["recalled"])
+        self.reverse(3)
+        a = self.tubes()["A"]
+        self.assertEqual(a["remaining"], "1000")  # 误扣用量已退回
+        self.assertTrue(a["recalled"])  # 已发召回继续有效
+        # 被召回的样品退回后也不能取用
+        with self.assertRaises(LedgerError) as ctx:
+            self.L.split([{"tube": "A", "amount": "1"}], [{"code": "Z", "amount": "1"}])
+        self.assertIn("召回", " ".join(ctx.exception.details))
+        # 召回记录仍在，被冲销的管标注为已失效
+        recall = self.L.recall_detail(1)
+        by_code = {x["code"]: x for x in recall["affected"]}
+        self.assertEqual(by_code["S1"]["current_status"], "voided")
+        self.assertEqual(by_code["S1"]["remaining"], "40")  # 当时快照不变
+        self.assertEqual(by_code["A"]["current_status"], "available")
+
+    def test_duplicate_submission_no_double_refund(self):
+        self.build_chain()
+        token = self.L.reverse_preview(3)["token"]
+        self.L.reverse(3, token)
+        with self.assertRaises(ConflictError) as ctx:
+            self.L.reverse(3, token)
+        self.assertIn("已被冲销", ctx.exception.message)
+        self.assertEqual(self.tubes()["A"]["remaining"], "1000")
+        # 换一个令牌再提交也一样
+        with self.assertRaises(ConflictError):
+            self.reverse(3)
+        self.assertEqual(self.tubes()["A"]["remaining"], "1000")
+
+    def test_reversing_voided_downstream_op_conflicts(self):
+        self.build_chain()
+        self.reverse(3)  # 级联把操作 4 也冲销了
+        with self.assertRaises(ConflictError):
+            self.reverse(4)
+
+    def test_token_invalidated_by_relevant_change(self):
+        self.build_chain()
+        token = self.L.reverse_preview(3)["token"]
+        # 预览后又从原管 A 取了一枪：相关库存变动，令牌失效
+        self.L.split([{"tube": "A", "amount": "10"}], [{"code": "X", "amount": "10"}])
+        with self.assertRaises(ConflictError) as ctx:
+            self.L.reverse(3, token)
+        self.assertIn("重新预览", ctx.exception.message)
+        # 重新预览后令牌更新，可以提交
+        self.reverse(3)
+        self.assertEqual(self.tubes()["A"]["remaining"], "990")
+        self.assertEqual(self.tubes()["X"]["remaining"], "10")
+
+    def test_token_invalidated_by_recall_on_source(self):
+        self.build_chain()
+        token = self.L.reverse_preview(3)["token"]
+        self.L.recall("LOT-A")
+        with self.assertRaises(ConflictError):
+            self.L.reverse(3, token)
+
+    def test_unrelated_change_does_not_invalidate_token(self):
+        self.build_chain()
+        token = self.L.reverse_preview(3)["token"]
+        self.L.register_intake("C", "LOT-C", "10")  # 无关来样
+        self.L.split([{"tube": "B", "amount": "5"}], [{"code": "T", "amount": "5"}])  # 无关分装
+        result = self.L.reverse(3, token)
+        self.assertEqual(result["reversal"]["root_op"], 3)
+        self.assertEqual(self.tubes()["A"]["remaining"], "1000")
+
+    def test_rejects_non_split_operations(self):
+        self.build_chain()
+        self.L.retire(["B"])
+        self.L.recall("LOT-A")
+        for bad in (1, 5, 6):  # intake / retire / recall
+            with self.assertRaises(LedgerError) as ctx:
+                self.L.reverse_preview(bad)
+            self.assertIn("只能冲销", ctx.exception.message)
+        with self.assertRaises(NotFoundError):
+            self.L.reverse_preview(99)
+        # 冲销操作本身也不能再被冲销
+        self.reverse(3)
+        with self.assertRaises(LedgerError):
+            self.L.reverse_preview(7)
+
+    def test_missing_token_rejected(self):
+        self.build_chain()
+        with self.assertRaises(LedgerError):
+            self.L.reverse(3, "")
+        with self.assertRaises(LedgerError):
+            self.L.reverse(3, None)
+
+    def test_fractional_amounts_refunded_exactly(self):
+        self.L.register_intake("A", "LOT-A", "1/3")
+        self.L.split([{"tube": "A", "amount": "1/7"}], [{"code": "S1", "amount": "1/7"}])
+        self.reverse(2)
+        a = self.tubes()["A"]
+        self.assertEqual(a["remaining"], "1/3")
+        self.assertEqual(Fraction(a["remaining"]), Fraction(1, 3))
+
+    def test_mid_write_failure_rolls_back(self):
+        self.build_chain()
+
+        def boom(stage, index=0):
+            if stage == "reverse-refund":
+                raise RuntimeError("模拟磁盘故障")
+
+        self.L._fault_injector = boom
+        token = self.L.reverse_preview(3)["token"]
+        with self.assertRaises(RuntimeError):
+            self.L.reverse(3, token)
+        self.L._fault_injector = None
+        # 半截状态不存在：账还是冲销前的账，可以重新提交
+        tubes = self.tubes()
+        self.assertEqual(tubes["A"]["remaining"], "900")
+        self.assertIn("S1", tubes)
+        self.assertEqual(self.L.inventory()["latest_seq"], 4)
+        self.reverse(3)
+        self.assertEqual(self.tubes()["A"]["remaining"], "1000")
+
+    def test_reverse_downstream_first_then_upstream(self):
+        self.build_chain()
+        # 先冲销下游 op4：S1 退回 60，S2 消失
+        self.reverse(4)
+        tubes = self.tubes()
+        self.assertEqual(tubes["S1"]["remaining"], "100")
+        self.assertNotIn("S2", tubes)
+        # 再冲销上游 op3：op4 已冲销不再重复退，只退 A 被误扣的 100
+        preview = self.L.reverse_preview(3)
+        self.assertEqual([op["id"] for op in preview["void_ops"]], [3])
+        self.assertEqual(
+            [(r["code"], r["amount"]) for r in preview["refunds"]], [("A", "100")]
+        )
+        self.reverse(3)
+        tubes = self.tubes()
+        self.assertEqual(tubes["A"]["remaining"], "1000")
+        self.assertNotIn("S1", tubes)
+
+    def test_reversal_persists_after_reopen(self):
+        self.build_chain()
+        self.reverse(3)
+        reopened = Ledger(self.db)
+        tubes = {t["code"]: t for t in reopened.inventory()["tubes"]}
+        self.assertEqual(tubes["A"]["remaining"], "1000")
+        self.assertNotIn("S1", tubes)
+        hist = reopened.history()["operations"]
+        self.assertEqual(hist[-1]["kind"], "reverse")
+        self.assertEqual(hist[2]["voided_by"], 5)
+        with self.assertRaises(ConflictError):
+            reopened.reverse(3, reopened.reverse_preview(3)["token"])
+
+
+class TestMigrationFromV1(unittest.TestCase):
+    """旧版（v1）数据库打开时自动迁移，数据与自增序号都保留。"""
+
+    V1_DDL = """
+    CREATE TABLE operations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind TEXT NOT NULL CHECK (kind IN ('intake', 'split', 'retire', 'recall')),
+        note TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE tubes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        code TEXT NOT NULL COLLATE NOCASE UNIQUE,
+        kind TEXT NOT NULL CHECK (kind IN ('intake', 'pooled')),
+        batch TEXT,
+        initial_volume TEXT NOT NULL,
+        composition TEXT NOT NULL,
+        created_op INTEGER NOT NULL REFERENCES operations(id),
+        created_at TEXT NOT NULL,
+        note TEXT NOT NULL DEFAULT ''
+    );
+    CREATE TABLE op_inputs (
+        op_id INTEGER NOT NULL REFERENCES operations(id),
+        tube_id INTEGER NOT NULL REFERENCES tubes(id),
+        amount TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        PRIMARY KEY (op_id, position)
+    );
+    CREATE TABLE op_outputs (
+        op_id INTEGER NOT NULL REFERENCES operations(id),
+        tube_id INTEGER NOT NULL REFERENCES tubes(id),
+        amount TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        PRIMARY KEY (op_id, position)
+    );
+    CREATE TABLE retire_items (
+        op_id INTEGER NOT NULL REFERENCES operations(id),
+        tube_id INTEGER NOT NULL REFERENCES tubes(id),
+        discarded TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        PRIMARY KEY (op_id, position)
+    );
+    CREATE TABLE recalls (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        op_id INTEGER NOT NULL UNIQUE REFERENCES operations(id),
+        batch TEXT NOT NULL,
+        note TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE recall_items (
+        recall_id INTEGER NOT NULL REFERENCES recalls(id),
+        tube_id INTEGER NOT NULL REFERENCES tubes(id),
+        code TEXT NOT NULL,
+        remaining TEXT NOT NULL,
+        composition TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        PRIMARY KEY (recall_id, position)
+    );
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Path(self.tmp.name) / "ledger.sqlite3"
+        conn = sqlite3.connect(self.db)
+        conn.executescript(self.V1_DDL)
+        conn.execute("PRAGMA user_version = 1")
+        conn.execute(
+            "INSERT INTO operations(kind, note, created_at) "
+            "VALUES ('intake', '旧数据', '2026-11-01T09:00:00+08:00')"
+        )
+        conn.execute(
+            "INSERT INTO tubes(code, kind, batch, initial_volume, composition, "
+            "created_op, created_at, note) "
+            "VALUES ('A', 'intake', 'LOT-A', '1000', '{\"1\": \"1\"}', 1, "
+            "'2026-11-01T09:00:00+08:00', '')"
+        )
+        conn.execute(
+            "INSERT INTO op_outputs(op_id, tube_id, amount, position) "
+            "VALUES (1, 1, '1000', 0)"
+        )
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_migrate_and_keep_working(self):
+        L = Ledger(self.db)
+        version = sqlite3.connect(self.db).execute("PRAGMA user_version").fetchone()[0]
+        self.assertEqual(version, 2)
+        # 旧数据还在
+        tubes = {t["code"]: t for t in L.inventory()["tubes"]}
+        self.assertEqual(tubes["A"]["remaining"], "1000")
+        # 自增序号延续（新操作应是 #2，而不是从 1 重来）
+        op = L.split([{"tube": "A", "amount": "100"}], [{"code": "S1", "amount": "100"}])
+        self.assertEqual(op["id"], 2)
+        # 迁移后可以正常冲销
+        token = L.reverse_preview(2)["token"]
+        L.reverse(2, token)
+        tubes = {t["code"]: t for t in L.inventory()["tubes"]}
+        self.assertEqual(tubes["A"]["remaining"], "1000")
+        self.assertNotIn("S1", tubes)
+        # 再开一次仍然有效
+        reopened = Ledger(self.db)
+        self.assertEqual(reopened.inventory()["latest_seq"], 3)
 
 
 class TestHistory(LedgerCase):

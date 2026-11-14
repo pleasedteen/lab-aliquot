@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import math
 import sqlite3
@@ -19,7 +21,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class LedgerError(Exception):
@@ -226,7 +228,7 @@ def _composition_text(comp_list: Iterable[dict[str, Any]]) -> str:
 DDL = """
 CREATE TABLE IF NOT EXISTS operations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind TEXT NOT NULL CHECK (kind IN ('intake', 'split', 'retire', 'recall')),
+    kind TEXT NOT NULL CHECK (kind IN ('intake', 'split', 'retire', 'recall', 'reverse')),
     note TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
 );
@@ -285,12 +287,47 @@ CREATE TABLE IF NOT EXISTS recall_items (
     PRIMARY KEY (recall_id, position)
 );
 
+CREATE TABLE IF NOT EXISTS reversals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    op_id INTEGER NOT NULL UNIQUE REFERENCES operations(id),
+    root_op_id INTEGER NOT NULL REFERENCES operations(id),
+    token TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS reversal_void_ops (
+    reversal_id INTEGER NOT NULL REFERENCES reversals(id),
+    op_id INTEGER NOT NULL REFERENCES operations(id),
+    position INTEGER NOT NULL,
+    PRIMARY KEY (reversal_id, position)
+);
+
+CREATE TABLE IF NOT EXISTS reversal_void_retires (
+    reversal_id INTEGER NOT NULL REFERENCES reversals(id),
+    op_id INTEGER NOT NULL REFERENCES operations(id),
+    tube_id INTEGER NOT NULL REFERENCES tubes(id),
+    position INTEGER NOT NULL,
+    PRIMARY KEY (reversal_id, position)
+);
+
+CREATE TABLE IF NOT EXISTS reversal_refunds (
+    reversal_id INTEGER NOT NULL REFERENCES reversals(id),
+    tube_id INTEGER NOT NULL REFERENCES tubes(id),
+    amount TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    PRIMARY KEY (reversal_id, position)
+);
+
 CREATE INDEX IF NOT EXISTS idx_op_inputs_tube ON op_inputs(tube_id);
 CREATE INDEX IF NOT EXISTS idx_op_outputs_tube ON op_outputs(tube_id);
 CREATE INDEX IF NOT EXISTS idx_retire_tube ON retire_items(tube_id);
 CREATE INDEX IF NOT EXISTS idx_recall_items_tube ON recall_items(tube_id);
 CREATE INDEX IF NOT EXISTS idx_tubes_batch ON tubes(batch);
 CREATE INDEX IF NOT EXISTS idx_tubes_created_op ON tubes(created_op);
+CREATE INDEX IF NOT EXISTS idx_reversal_void_ops_op ON reversal_void_ops(op_id);
+CREATE INDEX IF NOT EXISTS idx_reversal_void_retires_tube ON reversal_void_retires(tube_id);
+CREATE INDEX IF NOT EXISTS idx_reversal_refunds_tube ON reversal_refunds(tube_id);
 """
 
 
@@ -323,10 +360,56 @@ class Ledger:
                     raise RuntimeError(
                         f"数据库版本 {version} 高于本工具支持的 {SCHEMA_VERSION}"
                     )
+                if version == 1:
+                    self._migrate_1_to_2(conn)
                 conn.executescript(DDL)
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             finally:
                 conn.close()
+
+    @staticmethod
+    def _migrate_1_to_2(conn: sqlite3.Connection) -> None:
+        """v1 → v2：operations.kind 允许 'reverse'。
+
+        SQLite 不能修改 CHECK 约束，按官方流程重建 operations 表：
+        关外键 → 事务内建新表、复制、换名 → 重新打开外键并校验完整性。
+        """
+        conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            conn.execute("BEGIN")
+            conn.execute(
+                "CREATE TABLE operations_new ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "kind TEXT NOT NULL CHECK (kind IN "
+                "('intake', 'split', 'retire', 'recall', 'reverse')), "
+                "note TEXT NOT NULL DEFAULT '', "
+                "created_at TEXT NOT NULL)"
+            )
+            conn.execute(
+                "INSERT INTO operations_new (id, kind, note, created_at) "
+                "SELECT id, kind, note, created_at FROM operations"
+            )
+            conn.execute("DROP TABLE operations")
+            conn.execute("ALTER TABLE operations_new RENAME TO operations")
+            conn.execute(
+                "DELETE FROM sqlite_sequence WHERE name IN ('operations', 'operations_new')"
+            )
+            conn.execute(
+                "INSERT INTO sqlite_sequence (name, seq) "
+                "SELECT 'operations', COALESCE(MAX(id), 0) FROM operations"
+            )
+            conn.execute("COMMIT")
+        except BaseException:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.execute("PRAGMA foreign_keys = ON")
+        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise RuntimeError("数据库迁移后外键完整性校验失败")
 
     @contextmanager
     def _transaction(self):
@@ -367,42 +450,89 @@ class Ledger:
         ).fetchone()
 
     @staticmethod
-    def _used_map(conn: sqlite3.Connection, cutoff: int | None) -> dict[int, Fraction]:
+    def _void_maps(
+        conn: sqlite3.Connection, cutoff: int | None
+    ) -> tuple[dict[int, int], dict[tuple[int, int], int]]:
+        """返回 (被整单作废的操作 -> 冲销操作号, 被作废的报废明细(操作号, 管id) -> 冲销操作号)。
+
+        只计入 cutoff 时点已经发生的冲销；cutoff 为 None 表示当前（全部生效）。
+        历史回看（cutoff 小于冲销操作号）时冲销不生效，能看到冲销前的账。
+        """
         if cutoff is None:
-            rows = conn.execute("SELECT tube_id, amount FROM op_inputs").fetchall()
+            rev_rows = conn.execute("SELECT id, op_id FROM reversals").fetchall()
+        else:
+            rev_rows = conn.execute(
+                "SELECT id, op_id FROM reversals WHERE op_id <= ?", (cutoff,)
+            ).fetchall()
+        voided_ops: dict[int, int] = {}
+        voided_retires: dict[tuple[int, int], int] = {}
+        if not rev_rows:
+            return voided_ops, voided_retires
+        rev_op_by_id = {row["id"]: row["op_id"] for row in rev_rows}
+        placeholders = ",".join("?" for _ in rev_rows)
+        rev_ids = [row["id"] for row in rev_rows]
+        for row in conn.execute(
+            f"SELECT reversal_id, op_id FROM reversal_void_ops "
+            f"WHERE reversal_id IN ({placeholders})",
+            rev_ids,
+        ):
+            voided_ops[row["op_id"]] = rev_op_by_id[row["reversal_id"]]
+        for row in conn.execute(
+            f"SELECT reversal_id, op_id, tube_id FROM reversal_void_retires "
+            f"WHERE reversal_id IN ({placeholders})",
+            rev_ids,
+        ):
+            voided_retires[(row["op_id"], row["tube_id"])] = rev_op_by_id[
+                row["reversal_id"]
+            ]
+        return voided_ops, voided_retires
+
+    @staticmethod
+    def _used_map(
+        conn: sqlite3.Connection,
+        cutoff: int | None,
+        voided_ops: dict[int, int],
+    ) -> dict[int, Fraction]:
+        if cutoff is None:
+            rows = conn.execute("SELECT tube_id, amount, op_id FROM op_inputs").fetchall()
         else:
             rows = conn.execute(
-                "SELECT i.tube_id, i.amount FROM op_inputs i "
+                "SELECT i.tube_id, i.amount, i.op_id FROM op_inputs i "
                 "JOIN operations o ON o.id = i.op_id WHERE o.id <= ?",
                 (cutoff,),
             ).fetchall()
         used: dict[int, Fraction] = defaultdict(Fraction)
         for row in rows:
+            if row["op_id"] in voided_ops:
+                continue  # 已冲销的取样不计用量
             used[row["tube_id"]] += Fraction(row["amount"])
         return used
 
     @staticmethod
-    def _retire_map(conn: sqlite3.Connection, cutoff: int | None) -> dict[int, dict[str, Any]]:
-        if cutoff is None:
-            rows = conn.execute(
-                "SELECT r.tube_id, r.discarded, r.op_id, o.created_at "
-                "FROM retire_items r JOIN operations o ON o.id = r.op_id"
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT r.tube_id, r.discarded, r.op_id, o.created_at "
-                "FROM retire_items r JOIN operations o ON o.id = r.op_id "
-                "WHERE r.op_id <= ?",
-                (cutoff,),
-            ).fetchall()
-        return {
-            row["tube_id"]: {
+    def _retire_map(
+        conn: sqlite3.Connection,
+        cutoff: int | None,
+        voided_retires: dict[tuple[int, int], int],
+    ) -> dict[int, dict[str, Any]]:
+        sql = (
+            "SELECT r.tube_id, r.discarded, r.op_id, o.created_at "
+            "FROM retire_items r JOIN operations o ON o.id = r.op_id"
+        )
+        params: tuple = ()
+        if cutoff is not None:
+            sql += " WHERE r.op_id <= ?"
+            params = (cutoff,)
+        sql += " ORDER BY r.op_id"
+        result: dict[int, dict[str, Any]] = {}
+        for row in conn.execute(sql, params):
+            if (row["op_id"], row["tube_id"]) in voided_retires:
+                continue  # 该条报废明细已随冲销作废
+            result[row["tube_id"]] = {
                 "op_id": row["op_id"],
                 "created_at": row["created_at"],
                 "discarded": Fraction(row["discarded"]),
             }
-            for row in rows
-        }
+        return result
 
     @staticmethod
     def _recall_map(conn: sqlite3.Connection, cutoff: int | None) -> dict[int, list[dict[str, Any]]]:
@@ -428,15 +558,18 @@ class Ledger:
 
     def _snapshot(self, conn: sqlite3.Connection, cutoff: int | None = None) -> dict[int, dict[str, Any]]:
         """返回 tube_id -> 当前（或指定操作序号时点）状态。"""
+        voided_ops, voided_retires = self._void_maps(conn, cutoff)
         if cutoff is None:
             tube_rows = conn.execute("SELECT * FROM tubes ORDER BY id").fetchall()
         else:
             tube_rows = conn.execute(
                 "SELECT * FROM tubes WHERE created_op <= ? ORDER BY id", (cutoff,)
             ).fetchall()
+        # 被冲销分装所建立的管，在该时点视为从未存在
+        tube_rows = [row for row in tube_rows if row["created_op"] not in voided_ops]
         by_id = {row["id"]: row for row in tube_rows}
-        used = self._used_map(conn, cutoff)
-        retired = self._retire_map(conn, cutoff)
+        used = self._used_map(conn, cutoff, voided_ops)
+        retired = self._retire_map(conn, cutoff, voided_retires)
         recalled = self._recall_map(conn, cutoff)
         snapshot: dict[int, dict[str, Any]] = {}
         for row in tube_rows:
@@ -569,8 +702,16 @@ class Ledger:
         with self._read() as conn:
             return self._op_detail(conn, op_id)
 
-    def _op_detail(self, conn: sqlite3.Connection, op_id: int) -> dict[str, Any]:
+    def _op_detail(
+        self,
+        conn: sqlite3.Connection,
+        op_id: int,
+        void_maps: tuple[dict[int, int], dict[tuple[int, int], int]] | None = None,
+    ) -> dict[str, Any]:
         op = self._operation_row(conn, op_id)
+        if void_maps is None:
+            void_maps = self._void_maps(conn, None)
+        voided_ops, voided_retires = void_maps
         inputs = conn.execute(
             "SELECT i.amount, i.position, t.id AS tube_id, t.code, t.kind, t.batch "
             "FROM op_inputs i JOIN tubes t ON t.id = i.tube_id "
@@ -598,6 +739,7 @@ class Ledger:
             "kind": op["kind"],
             "note": op["note"],
             "created_at": op["created_at"],
+            "voided_by": voided_ops.get(op["id"]),
             "inputs": [
                 {
                     "tube_id": row["tube_id"],
@@ -631,10 +773,12 @@ class Ledger:
                     "discarded": row["discarded"],
                     "discarded_display": qty_display(Fraction(row["discarded"])
                                                       if row["discarded"] else Fraction(0)),
+                    "voided_by": voided_retires.get((op["id"], row["tube_id"])),
                 }
                 for row in retire_rows
             ],
             "recall": None,
+            "reversal": None,
         }
         if op["kind"] == "split":
             total_in = sum((Fraction(row["amount"]) for row in inputs), Fraction(0))
@@ -707,6 +851,90 @@ class Ledger:
                 "affected_count": len(affected),
                 "affected": affected,
             }
+        if op["kind"] == "reverse":
+            rev = conn.execute(
+                "SELECT * FROM reversals WHERE op_id = ?", (op_id,)
+            ).fetchone()
+            if rev is not None:
+                void_op_rows = conn.execute(
+                    "SELECT op_id FROM reversal_void_ops WHERE reversal_id = ? "
+                    "ORDER BY position",
+                    (rev["id"],),
+                ).fetchall()
+                void_ops_info = []
+                for vrow in void_op_rows:
+                    vins = conn.execute(
+                        "SELECT i.amount, t.code FROM op_inputs i "
+                        "JOIN tubes t ON t.id = i.tube_id "
+                        "WHERE i.op_id = ? ORDER BY i.position",
+                        (vrow["op_id"],),
+                    ).fetchall()
+                    vouts = conn.execute(
+                        "SELECT o.amount, t.code FROM op_outputs o "
+                        "JOIN tubes t ON t.id = o.tube_id "
+                        "WHERE o.op_id = ? ORDER BY o.position",
+                        (vrow["op_id"],),
+                    ).fetchall()
+                    void_ops_info.append(
+                        {
+                            "op_id": vrow["op_id"],
+                            "inputs": [
+                                {
+                                    "code": r["code"],
+                                    "amount": r["amount"],
+                                    "amount_display": qty_display(Fraction(r["amount"])),
+                                }
+                                for r in vins
+                            ],
+                            "outputs": [
+                                {
+                                    "code": r["code"],
+                                    "amount": r["amount"],
+                                    "amount_display": qty_display(Fraction(r["amount"])),
+                                }
+                                for r in vouts
+                            ],
+                        }
+                    )
+                void_retire_rows = conn.execute(
+                    "SELECT v.op_id, v.tube_id, t.code, r.discarded "
+                    "FROM reversal_void_retires v "
+                    "JOIN tubes t ON t.id = v.tube_id "
+                    "JOIN retire_items r ON r.op_id = v.op_id AND r.tube_id = v.tube_id "
+                    "WHERE v.reversal_id = ? ORDER BY v.position",
+                    (rev["id"],),
+                ).fetchall()
+                refund_rows = conn.execute(
+                    "SELECT v.tube_id, v.amount, t.code FROM reversal_refunds v "
+                    "JOIN tubes t ON t.id = v.tube_id "
+                    "WHERE v.reversal_id = ? ORDER BY v.position",
+                    (rev["id"],),
+                ).fetchall()
+                detail["reversal"] = {
+                    "id": rev["id"],
+                    "root_op": rev["root_op_id"],
+                    "note": rev["note"],
+                    "void_ops": void_ops_info,
+                    "void_retire_items": [
+                        {
+                            "op_id": r["op_id"],
+                            "tube_id": r["tube_id"],
+                            "code": r["code"],
+                            "discarded": r["discarded"],
+                            "discarded_display": qty_display(Fraction(r["discarded"])),
+                        }
+                        for r in void_retire_rows
+                    ],
+                    "refunds": [
+                        {
+                            "tube_id": r["tube_id"],
+                            "code": r["code"],
+                            "amount": r["amount"],
+                            "amount_display": qty_display(Fraction(r["amount"])),
+                        }
+                        for r in refund_rows
+                    ],
+                }
         return detail
 
     def history(self, limit: int | None = None) -> dict[str, Any]:
@@ -716,7 +944,8 @@ class Ledger:
             ids = [row["id"] for row in conn.execute(sql).fetchall()]
             if limit is not None:
                 ids = ids[-int(limit):]
-            ops = [self._op_detail(conn, op_id) for op_id in ids]
+            void_maps = self._void_maps(conn, None)
+            ops = [self._op_detail(conn, op_id, void_maps) for op_id in ids]
             return {"latest_seq": latest, "operations": ops}
 
     def tube_trace(self, code: str, seq: int | None = None) -> dict[str, Any]:
@@ -733,7 +962,21 @@ class Ledger:
             if seq is not None and row["created_op"] > seq:
                 raise NotFoundError(f"管 {code} 在操作 {seq} 时尚未建立")
             snapshot = self._snapshot(conn, seq)
-            item = snapshot[row["id"]]
+            item = snapshot.get(row["id"])
+            if item is None:
+                rev_row = conn.execute(
+                    "SELECT r.op_id AS rev_op FROM reversals r "
+                    "JOIN reversal_void_ops v ON v.reversal_id = r.id "
+                    "WHERE v.op_id = ?",
+                    (row["created_op"],),
+                ).fetchone()
+                if rev_row is not None:
+                    raise NotFoundError(
+                        f"管 {code} 由操作 #{row['created_op']} 建立，该操作已被冲销 "
+                        f"（冲销操作 #{rev_row['rev_op']}），管已失效；"
+                        "可用更早的操作序号回看冲销前的账"
+                    )
+                raise NotFoundError(f"找不到编号为 {code} 的管")
             composition = self._composition_amounts(item)
             tubes_by_id = {v["id"]: v for v in snapshot.values()}
 
@@ -792,6 +1035,7 @@ class Ledger:
                 "WHERE i.tube_id = ? ORDER BY o.id",
                 (row["id"],),
             ).fetchall()
+            voided_ops_now, _ = self._void_maps(conn, None)
             used_in = []
             for use in used_rows:
                 outs = conn.execute(
@@ -805,6 +1049,7 @@ class Ledger:
                         "op_id": use["op_id"],
                         "kind": use["kind"],
                         "created_at": use["created_at"],
+                        "voided_by": voided_ops_now.get(use["op_id"]),
                         "amount": use["amount"],
                         "amount_display": qty_display(Fraction(use["amount"])) if use["amount"] else None,
                         "outputs": [
@@ -941,10 +1186,23 @@ class Ledger:
                 "flow": flow,
             }
 
+    @staticmethod
+    def _missing_tube_status(
+        conn: sqlite3.Connection, tube_id: int, voided_ops: dict[int, int]
+    ) -> str:
+        """快照里找不到的管：若建立它的操作已被冲销，标记为 voided。"""
+        row = conn.execute(
+            "SELECT created_op FROM tubes WHERE id = ?", (tube_id,)
+        ).fetchone()
+        if row is not None and row["created_op"] in voided_ops:
+            return "voided"
+        return "unknown"
+
     def recalls(self) -> dict[str, Any]:
         with self._read() as conn:
             snapshot = self._snapshot(conn)
             by_id = {v["id"]: v for v in snapshot.values()}
+            voided_ops, _ = self._void_maps(conn, None)
             rows = conn.execute(
                 "SELECT * FROM recalls ORDER BY id"
             ).fetchall()
@@ -965,7 +1223,13 @@ class Ledger:
                             "remaining": item["remaining"],
                             "remaining_display": qty_display(Fraction(item["remaining"])),
                             "composition": json.loads(item["composition"]),
-                            "current_status": current["status"] if current else "unknown",
+                            "current_status": (
+                                current["status"]
+                                if current
+                                else self._missing_tube_status(
+                                    conn, item["tube_id"], voided_ops
+                                )
+                            ),
                             "current_remaining": current["remaining"] if current else None,
                             "current_remaining_display": current["remaining_display"]
                             if current
@@ -993,6 +1257,7 @@ class Ledger:
                 raise NotFoundError(f"召回记录 {recall_id} 不存在")
             snapshot = self._snapshot(conn)
             by_id = {v["id"]: v for v in snapshot.values()}
+            voided_ops, _ = self._void_maps(conn, None)
             items = conn.execute(
                 "SELECT tube_id, code, remaining, composition, position "
                 "FROM recall_items WHERE recall_id = ? ORDER BY position",
@@ -1008,7 +1273,13 @@ class Ledger:
                         "remaining": item["remaining"],
                         "remaining_display": qty_display(Fraction(item["remaining"])),
                         "composition": json.loads(item["composition"]),
-                        "current_status": current["status"] if current else "unknown",
+                        "current_status": (
+                            current["status"]
+                            if current
+                            else self._missing_tube_status(
+                                conn, item["tube_id"], voided_ops
+                            )
+                        ),
                         "current_remaining": current["remaining"] if current else None,
                         "current_remaining_display": current["remaining_display"]
                         if current
@@ -1164,7 +1435,13 @@ class Ledger:
                 row = tube_rows.get(entry["code"].casefold())
                 if row is None:
                     continue
-                item = snapshot[row["id"]]
+                item = snapshot.get(row["id"])
+                if item is None:
+                    problems.append(
+                        f"取样管 {entry['code']} 已失效：建立它的操作 "
+                        f"#{row['created_op']} 已被冲销"
+                    )
+                    continue
                 if item["status"] == "retired":
                     problems.append(f"取样管 {entry['code']} 已报废，不能取样")
                 elif item["status"] == "exhausted":
@@ -1266,7 +1543,13 @@ class Ledger:
                 if row is None:
                     problems.append(f"管 {code} 不存在")
                     continue
-                if snapshot[row["id"]]["status"] == "retired":
+                item = snapshot.get(row["id"])
+                if item is None:
+                    problems.append(
+                        f"管 {code} 已失效：建立它的操作 #{row['created_op']} 已被冲销"
+                    )
+                    continue
+                if item["status"] == "retired":
                     problems.append(f"管 {code} 已经报废")
                     continue
                 rows.append(row)
@@ -1367,6 +1650,280 @@ class Ledger:
                     ],
                 },
             }
+
+    # -- reversal（冲销） ----------------------------------------------------
+
+    def _reversal_plan(self, conn: sqlite3.Connection, root_op_id: int) -> dict[str, Any]:
+        """计算冲销一笔分装的完整影响（只读，不写库）。
+
+        级联规则：被冲销分装所建的管视为从未存在；凡取样来源含这些管的
+        后续分装一并整单作废；这些管上的报废明细一并作废（同一报废单里的
+        其他管不受影响）；召回记录不动，已发召回继续有效。
+
+        退回规则：被冲销分装从仍然存在的原管误扣的用量退回原管；来源本身
+        也在被作废链条里的属于内部倒手，不再重复退回。原管已报废则整笔
+        冲销拒绝执行。
+
+        返回的计划含确认令牌：执行时重新计算并比对，预览之后相关库存若有
+        变动（令牌不同）必须重新预览确认。
+        """
+        op = conn.execute(
+            "SELECT * FROM operations WHERE id = ?", (root_op_id,)
+        ).fetchone()
+        if op is None:
+            raise NotFoundError(f"操作 {root_op_id} 不存在")
+        if op["kind"] != "split":
+            kind_label = {
+                "intake": "来样登记",
+                "retire": "报废",
+                "recall": "召回",
+                "reverse": "冲销",
+            }.get(op["kind"], op["kind"])
+            raise LedgerError(
+                "只能冲销取样 / 分装操作",
+                [f"操作 #{root_op_id} 是「{kind_label}」，不支持冲销"],
+            )
+        voided_ops_done, voided_retires_done = self._void_maps(conn, None)
+        if root_op_id in voided_ops_done:
+            raise ConflictError(
+                f"操作 #{root_op_id} 已被冲销（见冲销操作 "
+                f"#{voided_ops_done[root_op_id]}），不会重复退回用量"
+            )
+
+        tube_rows = conn.execute("SELECT id, code, created_op FROM tubes").fetchall()
+        split_ids = {
+            row["id"]
+            for row in conn.execute("SELECT id FROM operations WHERE kind = 'split'")
+        }
+        input_rows = conn.execute(
+            "SELECT op_id, tube_id, amount FROM op_inputs"
+        ).fetchall()
+
+        # 级联不动点：凡取样来源含“被作废操作所建管”的分装，一并整单作废。
+        void_ops = set(voided_ops_done) | {root_op_id}
+        while True:
+            doomed = {t["id"] for t in tube_rows if t["created_op"] in void_ops}
+            grown = False
+            for inp in input_rows:
+                op_id = inp["op_id"]
+                if op_id in void_ops or op_id not in split_ids:
+                    continue
+                if inp["tube_id"] in doomed:
+                    void_ops.add(op_id)
+                    grown = True
+            if not grown:
+                break
+        doomed = {t["id"] for t in tube_rows if t["created_op"] in void_ops}
+        new_void_ops = sorted(void_ops - set(voided_ops_done))
+
+        # 被波及管上的报废明细一并作废；同一报废单里的其他管照常报废。
+        new_void_retires = sorted(
+            {
+                (row["op_id"], row["tube_id"])
+                for row in conn.execute(
+                    "SELECT op_id, tube_id FROM retire_items"
+                ).fetchall()
+                if row["tube_id"] in doomed
+                and (row["op_id"], row["tube_id"]) not in voided_retires_done
+            }
+        )
+
+        # 退回：被作废分装从“仍然存在的原管”误扣的用量退回原管；来源本身
+        # 也在被作废链条里的属于内部倒手，跳过（否则重复退回）。
+        refund_map: dict[int, Fraction] = defaultdict(Fraction)
+        for inp in input_rows:
+            if inp["op_id"] in new_void_ops and inp["tube_id"] not in doomed:
+                refund_map[inp["tube_id"]] += Fraction(inp["amount"])
+
+        snapshot = self._snapshot(conn)
+        problems: list[str] = []
+        refunds: list[dict[str, Any]] = []
+        for tube_id in sorted(refund_map):
+            amount = refund_map[tube_id]
+            item = snapshot.get(tube_id)
+            if item is None:  # 兜底，理论上不会发生
+                problems.append(f"原管 #{tube_id} 已不存在，无法退回 {qty_str(amount)} µL")
+                continue
+            remaining_after = item["remaining_fraction"] + amount
+            refunds.append(
+                {
+                    "tube_id": tube_id,
+                    "code": item["code"],
+                    "amount": qty_str(amount),
+                    "amount_display": qty_display(amount),
+                    "remaining_before": item["remaining"],
+                    "remaining_before_display": item["remaining_display"],
+                    "remaining_after": qty_str(remaining_after),
+                    "remaining_after_display": qty_display(remaining_after),
+                    "status": item["status"],
+                    "recalled": item["recalled"],
+                    "recall_batches": sorted({r["batch"] for r in item["recalls"]}),
+                }
+            )
+            if item["status"] == "retired":
+                problems.append(
+                    f"原管 {item['code']} 已报废，误扣的 {qty_display(amount)} µL "
+                    "无法退回；请先单独处理该管的报废记录"
+                )
+
+        # 确认令牌：覆盖本次冲销的全部效果与相关原管状态。预览之后相关库存
+        # 一旦有变动，令牌即失效，必须重新预览确认；无关操作不影响令牌。
+        token_payload = {
+            "root": root_op_id,
+            "void_ops": new_void_ops,
+            "void_retires": [list(pair) for pair in new_void_retires],
+            "refunds": [{"tube": t["tube_id"], "amount": t["amount"]} for t in refunds],
+            "sources": [
+                {
+                    "tube": t["tube_id"],
+                    "remaining": t["remaining_before"],
+                    "status": t["status"],
+                    "recalled": t["recalled"],
+                }
+                for t in refunds
+            ],
+        }
+        token = hashlib.sha256(
+            json.dumps(token_payload, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+
+        # 将消失的管（本次新作废的分装所建立的管）
+        doomed_tubes = []
+        for t in sorted(tube_rows, key=lambda x: x["id"]):
+            if t["created_op"] not in new_void_ops:
+                continue
+            item = snapshot.get(t["id"])
+            if item is None:
+                continue
+            doomed_tubes.append(
+                {
+                    "tube_id": t["id"],
+                    "code": item["code"],
+                    "initial_volume": item["initial_volume"],
+                    "initial_volume_display": item["initial_volume_display"],
+                    "remaining": item["remaining"],
+                    "remaining_display": item["remaining_display"],
+                    "status": item["status"],
+                    "recalled": item["recalled"],
+                    "created_op": item["created_op"],
+                }
+            )
+
+        tube_code = {t["id"]: t["code"] for t in tube_rows}
+        retire_discarded = {
+            (row["op_id"], row["tube_id"]): row["discarded"]
+            for row in conn.execute(
+                "SELECT op_id, tube_id, discarded FROM retire_items"
+            ).fetchall()
+        }
+        void_retire_items = []
+        for op_id, tube_id in new_void_retires:
+            discarded = retire_discarded.get((op_id, tube_id))
+            void_retire_items.append(
+                {
+                    "op_id": op_id,
+                    "tube_id": tube_id,
+                    "code": tube_code.get(tube_id),
+                    "discarded": discarded,
+                    "discarded_display": qty_display(Fraction(discarded))
+                    if discarded
+                    else None,
+                }
+            )
+
+        preview = {
+            "root_op": root_op_id,
+            "root": self._op_detail(conn, root_op_id),
+            "latest_seq": self._latest_seq(conn),
+            "ok": not problems,
+            "problems": problems,
+            "token": token,
+            "void_ops": [self._op_detail(conn, op_id) for op_id in new_void_ops],
+            "void_retire_items": void_retire_items,
+            "doomed_tubes": doomed_tubes,
+            "refunds": refunds,
+        }
+        return {
+            "preview": preview,
+            "token": token,
+            "void_op_ids": new_void_ops,
+            "void_retire_ids": new_void_retires,
+            "refund_items": [(t["tube_id"], refund_map[t["tube_id"]]) for t in refunds],
+            "problems": problems,
+        }
+
+    def reverse_preview(self, op_id: Any) -> dict[str, Any]:
+        """预览冲销一笔分装的全部影响，返回确认令牌。"""
+        try:
+            op_id = int(op_id)
+        except (TypeError, ValueError):
+            raise LedgerError("操作序号格式不正确")
+        with self._read() as conn:
+            return self._reversal_plan(conn, op_id)["preview"]
+
+    def reverse(self, op_id: Any, token: Any, note: Any = "") -> dict[str, Any]:
+        """整批冲销一笔分装及依赖它的后续操作。
+
+        必须携带预览令牌提交；令牌与实时计算不一致说明预览之后相关库存
+        已有变动，拒绝执行并要求重新预览。同一操作只能被冲销一次，重复
+        提交不会重复退回用量。
+        """
+        try:
+            op_id = int(op_id)
+        except (TypeError, ValueError):
+            raise LedgerError("操作序号格式不正确")
+        note = parse_note(note)
+        if not isinstance(token, str) or not token.strip():
+            raise LedgerError("缺少预览令牌：请先预览影响，再确认冲销")
+        token = token.strip()
+
+        with self._transaction() as conn:
+            plan = self._reversal_plan(conn, op_id)
+            if not hmac.compare_digest(token, plan["token"]):
+                raise ConflictError(
+                    "预览之后相关库存已有变动，请重新预览确认后再提交冲销"
+                )
+            if plan["problems"]:
+                raise LedgerError("冲销未提交，请检查以下问题", plan["problems"])
+
+            self._fault("reverse-before-insert")
+            cur = conn.execute(
+                "INSERT INTO operations(kind, note, created_at) VALUES ('reverse', ?, ?)",
+                (note, now_text()),
+            )
+            rev_op_id = int(cur.lastrowid)
+            cur = conn.execute(
+                "INSERT INTO reversals(op_id, root_op_id, token, note, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (rev_op_id, op_id, plan["token"], note, now_text()),
+            )
+            reversal_id = int(cur.lastrowid)
+            self._fault("reverse-after-header")
+            for pos, void_op in enumerate(plan["void_op_ids"]):
+                conn.execute(
+                    "INSERT INTO reversal_void_ops(reversal_id, op_id, position) "
+                    "VALUES (?, ?, ?)",
+                    (reversal_id, void_op, pos),
+                )
+                self._fault("reverse-void-op", pos)
+            for pos, (retire_op, tube_id) in enumerate(plan["void_retire_ids"]):
+                conn.execute(
+                    "INSERT INTO reversal_void_retires(reversal_id, op_id, tube_id, "
+                    "position) VALUES (?, ?, ?, ?)",
+                    (reversal_id, retire_op, tube_id, pos),
+                )
+                self._fault("reverse-void-retire", pos)
+            for pos, (tube_id, amount) in enumerate(plan["refund_items"]):
+                conn.execute(
+                    "INSERT INTO reversal_refunds(reversal_id, tube_id, amount, "
+                    "position) VALUES (?, ?, ?, ?)",
+                    (reversal_id, tube_id, qty_str(amount), pos),
+                )
+                self._fault("reverse-refund", pos)
+            detail = self._op_detail(conn, rev_op_id)
+            return {"operation": detail, "reversal": detail["reversal"]}
 
     # -- exports ------------------------------------------------------------
 

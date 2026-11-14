@@ -139,6 +139,15 @@ class Api:
         if path == "/api/recall" and method == "POST":
             return L.recall(data.get("batch"), data.get("note", ""))
 
+        if path == "/api/reverse/preview" and method == "GET":
+            op = arg("op")
+            if not op:
+                raise LedgerError("缺少操作序号")
+            return L.reverse_preview(op)
+
+        if path == "/api/reverse" and method == "POST":
+            return L.reverse(data.get("op"), data.get("token"), data.get("note", ""))
+
         if path == "/api/export/inventory" and method == "GET":
             return self._csv(L.inventory_csv(), "inventory.csv")
 

@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>样品台账 · 留样质检</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">样</span>
+    <div>
+      <h1>样品台账</h1>
+      <p class="sub">留样质检 · 取样 / 混合 / 报废 / 召回</p>
+    </div>
+  </div>
+  <nav class="tabs" id="tabs">
+    <button class="tab active" data-tab="inventory">库存总览</button>
+    <button class="tab" data-tab="intake">来样登记</button>
+    <button class="tab" data-tab="split">取样 / 分装</button>
+    <button class="tab" data-tab="retire">报废</button>
+    <button class="tab" data-tab="recall">召回</button>
+    <button class="tab" data-tab="trace">追溯</button>
+    <button class="tab" data-tab="history">操作历史</button>
+  </nav>
+  <div class="exports">
+    <a class="btn ghost small" href="/api/export/inventory" download>导出库存 CSV</a>
+    <a class="btn ghost small" href="/api/export/recalls" download>导出召回清单 CSV</a>
+  </div>
+</header>
+
+<main id="app">
+  <div class="loading">正在读取台账…</div>
+</main>
+
+<div id="toasts" class="toasts" aria-live="polite"></div>
+
+<template id="tpl-error">
+  <div class="alert error">
+    <strong class="err-title"></strong>
+    <ul class="err-details"></ul>
+  </div>
+</template>
+
+<script src="/app.js"></script>
+</body>
+</html>

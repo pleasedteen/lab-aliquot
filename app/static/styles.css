@@ -143,6 +143,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .badge.danger { background: var(--danger-soft); color: var(--danger); }
 .badge.neutral { background: #eef1f6; color: #4b5565; }
 .badge.info { background: var(--accent-soft); color: var(--accent); }
+.badge.dry { background: #f3ecff; color: #6b34c9; }
 
 .btn {
   display: inline-flex;
@@ -186,6 +187,7 @@ input:focus, select:focus, textarea:focus {
 input.invalid { border-color: var(--danger); background: #fffafa; }
 textarea { resize: vertical; min-height: 64px; }
 .help { color: var(--muted); font-size: 12px; margin-top: 4px; }
+.help.danger-text { color: var(--danger); }
 .row { display: flex; gap: 10px; align-items: flex-end; }
 .row > * { flex: 1; }
 .row > .shrink { flex: 0 0 auto; }

@@ -136,6 +136,12 @@ class Api:
         if path == "/api/retire" and method == "POST":
             return L.retire(data.get("tubes"), data.get("note", ""))
 
+        if path == "/api/lyophilize" and method == "POST":
+            return L.lyophilize(data.get("tubes"), data.get("note", ""))
+
+        if path == "/api/reconstitute" and method == "POST":
+            return L.reconstitute(data.get("tubes"), data.get("note", ""))
+
         if path == "/api/recall" and method == "POST":
             return L.recall(data.get("batch"), data.get("note", ""))
 

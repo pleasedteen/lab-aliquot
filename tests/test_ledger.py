@@ -379,6 +379,312 @@ class TestHistory(LedgerCase):
             self.L.state_at(5)
 
 
+class TestLyophilizeAndReconstitute(LedgerCase):
+    """冻干保存：干样仍在库、原样折算量保留，复溶按实测体积记账。"""
+
+    def build(self):
+        self.L.register_intake("A", "LOT-A", "1000")
+        self.L.register_intake("B", "LOT-B", "500")
+        self.L.split(
+            [{"tube": "A", "amount": "400"}, {"tube": "B", "amount": "200"}],
+            [{"code": "M1", "amount": "600"}],
+        )
+
+    def test_lyophilize_keeps_equivalent_and_goes_dry(self):
+        self.build()
+        op = self.L.lyophilize(["M1"], "冻干保存")
+        self.assertEqual(op["kind"], "lyophilize")
+        proc = op["processing"][0]
+        self.assertEqual(proc["form_before"], "liquid")
+        self.assertEqual(proc["volume_before"], "600")
+        self.assertEqual(proc["form_after"], "dry")
+        self.assertEqual(proc["volume_after"], "0")
+        # 原样折算量前后不变
+        self.assertEqual(proc["equivalent_before"], "600")
+        self.assertEqual(proc["equivalent_after"], "600")
+
+        m1 = self.tubes()["M1"]
+        self.assertTrue(m1["is_dry"])
+        self.assertEqual(m1["status"], "available")  # 干样仍在库
+        self.assertEqual(m1["remaining"], "0")
+        self.assertEqual(m1["remaining_equivalent"], "600")
+        # 组成保持不变
+        self.assertEqual(
+            {c["intake_code"]: c["share"] for c in m1["composition"]},
+            {"A": "2/3", "B": "1/3"},
+        )
+
+    def test_dry_tube_cannot_be_sampled(self):
+        self.build()
+        self.L.lyophilize(["M1"])
+        with self.assertRaises(LedgerError) as ctx:
+            self.L.split([{"tube": "M1", "amount": "10"}], [{"code": "X", "amount": "10"}])
+        self.assertIn("干样", " ".join(ctx.exception.details))
+        self.assertNotIn("X", self.tubes())
+
+    def test_reconstitute_records_measured_volume(self):
+        self.build()
+        self.L.lyophilize(["M1"])
+        op = self.L.reconstitute([{"tube": "M1", "volume": "500"}], "空白溶剂复溶")
+        self.assertEqual(op["kind"], "reconstitute")
+        proc = op["processing"][0]
+        self.assertEqual(proc["volume_before"], "0")
+        self.assertEqual(proc["form_after"], "liquid")
+        self.assertEqual(proc["volume_after"], "500")
+        self.assertEqual(proc["equivalent_after"], "600")
+        m1 = self.tubes()["M1"]
+        self.assertFalse(m1["is_dry"])
+        self.assertEqual(m1["remaining"], "500")
+        self.assertEqual(m1["remaining_equivalent"], "600")
+
+    def test_reconstitute_requires_measured_volume(self):
+        self.build()
+        self.L.lyophilize(["M1"])
+        with self.assertRaises(LedgerError):
+            self.L.reconstitute([{"tube": "M1"}])
+        self.L.reconstitute([{"tube": "M1", "volume": "100"}])
+        with self.assertRaises(LedgerError):
+            self.L.reconstitute([{"tube": "M1", "volume": "100"}])  # 已不是干样
+
+    def test_reconstitute_rejects_liquid_tube(self):
+        self.build()
+        with self.assertRaises(LedgerError) as ctx:
+            self.L.reconstitute([{"tube": "M1", "volume": "100"}])
+        self.assertIn("不是干样", " ".join(ctx.exception.details))
+
+    def test_split_after_reconstitute_carries_equivalent_by_volume(self):
+        self.build()
+        self.L.lyophilize(["M1"])
+        self.L.reconstitute([{"tube": "M1", "volume": "500"}])
+        op = self.L.split(
+            [{"tube": "M1", "amount": "250"}, {"tube": "A", "amount": "100"}],
+            [{"code": "P1", "amount": "350"}],
+        )
+        m1_in = next(i for i in op["inputs"] if i["code"] == "M1")
+        # 250/500 × 600 = 300
+        self.assertEqual(m1_in["equivalent"], "300")
+        p1 = self.tubes()["P1"]
+        self.assertEqual(p1["initial_equivalent"], "400")  # 300 + 100
+        self.assertEqual(p1["initial_volume"], "350")
+        # 折算量守恒
+        self.assertEqual(op["total_equivalent_in"], op["total_equivalent_out"])
+        m1 = self.tubes()["M1"]
+        self.assertEqual(m1["remaining"], "250")
+        self.assertEqual(m1["remaining_equivalent"], "300")
+
+    def _total_equivalent(self):
+        with self.L._read() as conn:
+            snapshot = self.L._snapshot(conn)
+        return sum(t["remaining_equivalent_fraction"] for t in snapshot.values())
+
+    def test_equivalent_conserved_across_dry_recon_and_split_chain(self):
+        self.build()
+        before = self._total_equivalent()
+        self.L.lyophilize(["M1"])
+        self.L.reconstitute([{"tube": "M1", "volume": "1000"}])
+        self.L.split([{"tube": "M1", "amount": "100"}], [{"code": "P1", "amount": "100"}])
+        self.assertEqual(before, self._total_equivalent())
+
+    def test_dry_tube_counts_as_in_stock_for_recall(self):
+        self.build()
+        self.L.lyophilize(["M1"])
+        result = self.L.recall("LOT-A", "问题")
+        codes = [a["code"] for a in result["recall"]["affected"]]
+        self.assertIn("M1", codes)
+        m1 = next(a for a in result["recall"]["affected"] if a["code"] == "M1")
+        self.assertEqual(m1["form"], "dry")
+        self.assertEqual(m1["remaining"], "0")
+        self.assertEqual(m1["equivalent"], "600")
+        with self.assertRaises(LedgerError):
+            self.L.reconstitute([{"tube": "M1", "volume": "100"}])
+
+    def test_recall_covers_children_produced_from_reconstituted_tube(self):
+        self.build()
+        self.L.lyophilize(["M1"])
+        self.L.reconstitute([{"tube": "M1", "volume": "500"}])
+        self.L.split([{"tube": "M1", "amount": "200"}], [{"code": "K1", "amount": "200"}])
+        result = self.L.recall("LOT-A", "问题")
+        codes = {a["code"] for a in result["recall"]["affected"]}
+        self.assertIn("K1", codes)
+        self.assertIn("M1", codes)
+
+    def test_history_keeps_form_and_volume_before_after(self):
+        self.build()
+        self.L.lyophilize(["M1"])          # 操作 4
+        self.L.reconstitute([{"tube": "M1", "volume": "500"}])  # 操作 5
+        latest = self.L.inventory()["latest_seq"]
+        at_dry = {t["code"]: t for t in self.L.inventory(4)["tubes"]}["M1"]
+        self.assertEqual((at_dry["form"], at_dry["remaining"], at_dry["remaining_equivalent"]),
+                         ("dry", "0", "600"))
+        # 复溶前一刻（操作 4）仍是干样，操作 5 之后才是液体
+        at_recon = {t["code"]: t for t in self.L.inventory(5)["tubes"]}["M1"]
+        self.assertEqual((at_recon["form"], at_recon["remaining"]), ("liquid", "500"))
+        self.assertEqual(latest, 5)
+        # 冻干之前仍是液体、体积满额
+        before_dry = {t["code"]: t for t in self.L.inventory(3)["tubes"]}["M1"]
+        self.assertEqual((before_dry["form"], before_dry["remaining"]), ("liquid", "600"))
+
+    def test_tube_trace_shows_processing_and_form(self):
+        self.build()
+        self.L.lyophilize(["M1"])
+        self.L.reconstitute([{"tube": "M1", "volume": "500"}])
+        data = self.L.tube_trace("M1")
+        self.assertEqual([p["action"] for p in data["processing"]], ["dry", "reconstitute"])
+        self.assertEqual(data["processing"][0]["volume_after"], "0")
+        self.assertEqual(data["processing"][1]["volume_after"], "500")
+        self.assertEqual(data["tube"]["form"], "liquid")
+
+    def test_retire_dry_tube_records_equivalent(self):
+        self.build()
+        self.L.lyophilize(["M1"])
+        self.L.retire(["M1"], "冻干后报废")
+        m1 = self.tubes()["M1"]
+        self.assertEqual(m1["status"], "retired")
+        self.assertEqual(m1["discarded"], "0")
+        self.assertEqual(m1["discarded_equivalent"], "600")
+
+    def test_lyophilize_rejects_exhausted_and_invalid(self):
+        self.build()
+        self.L.split([{"tube": "A", "amount": "600"}], [{"code": "Z", "amount": "600"}])
+        with self.assertRaises(LedgerError) as ctx:
+            self.L.lyophilize(["A"])  # A 已用尽
+        self.assertIn("已用尽", " ".join(ctx.exception.details))
+        with self.assertRaises(LedgerError):
+            self.L.lyophilize(["NOPE"])
+        with self.assertRaises(LedgerError):
+            self.L.lyophilize([])
+        # 重复冻干被拒绝
+        self.L.lyophilize(["M1"])
+        with self.assertRaises(LedgerError) as ctx:
+            self.L.lyophilize(["M1"])
+        self.assertIn("已经是干样", " ".join(ctx.exception.details))
+
+    def test_process_rolls_back_when_one_missing(self):
+        self.build()
+        with self.assertRaises(LedgerError):
+            self.L.lyophilize(["M1", "NOPE"])
+        self.assertFalse(self.tubes()["M1"]["is_dry"])
+        self.assertEqual(self.L.inventory()["latest_seq"], 3)
+
+    def test_process_mid_write_failure_rolls_back(self):
+        self.build()
+
+        def boom(stage, index=0):
+            if stage == "process-item" and index == 1:
+                raise RuntimeError("模拟磁盘故障")
+
+        self.L._fault_injector = boom
+        with self.assertRaises(RuntimeError):
+            self.L.lyophilize(["M1", "A"])
+        self.L._fault_injector = None
+        self.assertFalse(self.tubes()["M1"]["is_dry"])
+        self.assertFalse(self.tubes()["A"]["is_dry"])
+        self.assertEqual(self.L.inventory()["latest_seq"], 3)
+
+    def test_batch_trace_shows_equivalent_for_dry_children(self):
+        self.build()
+        self.L.lyophilize(["M1"])
+        data = self.L.batch_trace("LOT-A")
+        m1 = next(t for t in data["tubes"] if t["code"] == "M1")
+        self.assertTrue(m1["is_dry"])
+        self.assertEqual(m1["batch_equivalent_remaining"], "400")  # 2/3 × 600
+        self.assertEqual(m1["batch_amount_remaining"], "0")  # 体积账已归零
+
+    def test_reopen_keeps_dry_state(self):
+        self.build()
+        self.L.lyophilize(["M1"])
+        self.L.reconstitute([{"tube": "M1", "volume": "500"}])
+        self.L = None
+        reopened = Ledger(self.db)
+        m1 = {t["code"]: t for t in reopened.inventory()["tubes"]}["M1"]
+        self.assertEqual(m1["remaining"], "500")
+        self.assertEqual(m1["remaining_equivalent"], "600")
+        trace = reopened.tube_trace("M1")
+        self.assertEqual(len(trace["processing"]), 2)
+
+
+class TestSchemaMigration(unittest.TestCase):
+    """v1 数据库升级到 v2：补列、回填折算量，旧数据仍可追溯并可继续冻干/复溶。"""
+
+    V1_DDL = """
+    CREATE TABLE operations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind TEXT NOT NULL CHECK (kind IN ('intake', 'split', 'retire', 'recall')),
+        note TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE tubes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        code TEXT NOT NULL COLLATE NOCASE UNIQUE,
+        kind TEXT NOT NULL CHECK (kind IN ('intake', 'pooled')),
+        batch TEXT,
+        initial_volume TEXT NOT NULL,
+        composition TEXT NOT NULL,
+        created_op INTEGER NOT NULL REFERENCES operations(id),
+        created_at TEXT NOT NULL,
+        note TEXT NOT NULL DEFAULT ''
+    );
+    CREATE TABLE op_inputs (op_id INTEGER, tube_id INTEGER, amount TEXT, position INTEGER,
+                            PRIMARY KEY(op_id, position));
+    CREATE TABLE op_outputs (op_id INTEGER, tube_id INTEGER, amount TEXT, position INTEGER,
+                             PRIMARY KEY(op_id, position));
+    CREATE TABLE retire_items (op_id INTEGER, tube_id INTEGER, discarded TEXT, position INTEGER,
+                               PRIMARY KEY(op_id, position));
+    CREATE TABLE recalls (id INTEGER PRIMARY KEY AUTOINCREMENT, op_id INTEGER UNIQUE, batch TEXT,
+                          note TEXT, created_at TEXT);
+    CREATE TABLE recall_items (recall_id INTEGER, tube_id INTEGER, code TEXT, remaining TEXT,
+                               composition TEXT, position INTEGER, PRIMARY KEY(recall_id, position));
+    """
+
+    def test_v1_database_upgrades_and_continues(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "v1.sqlite3"
+            conn = sqlite3.connect(db)
+            conn.executescript(self.V1_DDL)
+            conn.execute(
+                "INSERT INTO operations(kind,note,created_at) VALUES ('intake','','2026-01-01')"
+            )
+            conn.execute(
+                "INSERT INTO tubes(code,kind,batch,initial_volume,composition,created_op,"
+                "created_at,note) VALUES ('A','intake','LOT-A','1000',?,1,'2026','')",
+                (json.dumps({"1": "1"}),),
+            )
+            conn.execute(
+                "INSERT INTO op_outputs(op_id,tube_id,amount,position) VALUES (1,1,'1000',0)"
+            )
+            conn.execute(
+                "INSERT INTO operations(kind,note,created_at) VALUES ('split','','2026-01-02')"
+            )
+            conn.execute(
+                "INSERT INTO op_inputs(op_id,tube_id,amount,position) VALUES (2,1,'100',0)"
+            )
+            conn.execute(
+                "INSERT INTO tubes(code,kind,batch,initial_volume,composition,created_op,"
+                "created_at,note) VALUES ('S1','pooled',NULL,'100',?,2,'2026','')",
+                (json.dumps({"1": "1"}),),
+            )
+            conn.execute(
+                "INSERT INTO op_outputs(op_id,tube_id,amount,position) VALUES (2,2,'100',0)"
+            )
+            conn.execute("PRAGMA user_version = 1")
+            conn.commit()
+            conn.close()
+
+            L = Ledger(db)
+            tubes = {t["code"]: t for t in L.inventory()["tubes"]}
+            self.assertEqual(tubes["A"]["remaining"], "900")
+            self.assertEqual(tubes["A"]["remaining_equivalent"], "800")
+            self.assertEqual(tubes["S1"]["remaining"], "100")
+            self.assertEqual(tubes["S1"]["remaining_equivalent"], "100")
+            self.assertEqual([o["kind"] for o in L.history()["operations"]], ["intake", "split"])
+            # 升级后可继续使用新流程
+            L.lyophilize(["S1"])
+            L.reconstitute([{"tube": "S1", "volume": "80"}])
+            s1 = {t["code"]: t for t in L.inventory()["tubes"]}["S1"]
+            self.assertEqual(s1["remaining"], "80")
+            self.assertEqual(s1["remaining_equivalent"], "100")
+
+
 class TestPersistenceAndExport(LedgerCase):
     def test_reopen_keeps_data(self):
         self.L.register_intake("A", "LOT-A", "1000")

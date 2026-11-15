@@ -99,6 +99,30 @@ function statusBadge(t) {
   return h("span", { class: `badge ${cls}` }, label);
 }
 
+function formBadge(t) {
+  if (t.is_dry || t.form === "dry") {
+    return h(
+      "span",
+      { class: "badge dry", title: "已冻干，干样不能直接移取，需先复溶" },
+      "干样"
+    );
+  }
+  return h("span", { class: "badge neutral" }, "液体");
+}
+
+const KIND_LABEL = {
+  intake: ["neutral", "来样登记"],
+  split: ["info", "取样 / 分装"],
+  retire: ["warn", "报废"],
+  recall: ["danger", "召回"],
+  lyophilize: ["dry", "冻干"],
+  reconstitute: ["info", "复溶"],
+};
+
+function operationLabel(kind) {
+  return KIND_LABEL[kind] || ["neutral", kind];
+}
+
 function recalledBadge(t) {
   if (!t.recalled) return h("span", { class: "muted small" }, "—");
   const batches = [...new Set((t.recalls || []).map((r) => r.batch))].join("、");
@@ -212,6 +236,8 @@ async function render() {
     inventory: renderInventory,
     intake: renderIntake,
     split: renderSplit,
+    lyophilize: renderLyophilize,
+    reconstitute: renderReconstitute,
     retire: renderRetire,
     recall: renderRecall,
     trace: renderTrace,
@@ -280,6 +306,7 @@ function renderInventory() {
     { class: "stats" },
     h("div", { class: "stat" }, h("div", { class: "n" }, c.total), h("div", { class: "l" }, "全部管数")),
     h("div", { class: "stat" }, h("div", { class: "n" }, c.available), h("div", { class: "l" }, "在库可用")),
+    h("div", { class: "stat" }, h("div", { class: "n" }, c.dry_in_stock ?? 0), h("div", { class: "l" }, "干样在库")),
     h("div", { class: "stat" }, h("div", { class: "n" }, c.exhausted), h("div", { class: "l" }, "已用尽")),
     h("div", { class: "stat" }, h("div", { class: "n" }, c.retired), h("div", { class: "l" }, "已报废")),
     h("div", { class: "stat danger" }, h("div", { class: "n" }, c.recalled_in_stock), h("div", { class: "l" }, "召回禁取样"))
@@ -291,6 +318,7 @@ function renderInventory() {
     {},
     h("option", { value: "" }, "全部状态"),
     h("option", { value: "available" }, "可用"),
+    h("option", { value: "dry" }, "仅干样"),
     h("option", { value: "exhausted" }, "已用尽"),
     h("option", { value: "retired" }, "已报废"),
     h("option", { value: "recalled" }, "召回中"),
@@ -307,6 +335,7 @@ function renderInventory() {
     const f = filterState.value;
     let rows = inv.tubes.filter((t) => {
       if (f === "recalled" && !(t.recalled && t.status === "available")) return false;
+      if (f === "dry" && !t.is_dry) return false;
       if (["available", "exhausted", "retired"].includes(f) && t.status !== f) return false;
       if (f === "intake" && t.kind !== "intake") return false;
       if (f === "pooled" && t.kind !== "pooled") return false;
@@ -323,7 +352,7 @@ function renderInventory() {
     rows = rows.slice().sort((a, b) => {
       const av = a[sortKey];
       const bv = b[sortKey];
-      if (sortKey === "remaining") {
+      if (["remaining", "remaining_equivalent", "initial_equivalent"].includes(sortKey)) {
         return (Number(av) - Number(bv)) * sortDir;
       }
       return String(av ?? "").localeCompare(String(bv ?? ""), "zh") * sortDir;
@@ -364,10 +393,13 @@ function renderInventory() {
           th("code", "编号"),
           th("kind", "类型"),
           th("batch", "来样批次"),
+          th("form", "物态"),
           th("status", "状态"),
           th("recalled", "召回"),
           th("initial_volume", "初始量 µL", "num"),
           th("remaining", "剩余量 µL", "num"),
+          th("initial_equivalent", "原样折算量 µL", "num"),
+          th("remaining_equivalent", "折算量剩余 µL", "num"),
           th("id", "组成（来源占比）")
         )
       ),
@@ -393,10 +425,13 @@ function renderInventory() {
             ),
             h("td", {}, t.kind === "intake" ? h("span", { class: "badge neutral" }, "来样") : h("span", { class: "badge info" }, "分装/混合")),
             h("td", {}, t.batch || h("span", { class: "muted" }, "—")),
+            h("td", {}, formBadge(t)),
             h("td", {}, statusBadge(t)),
             h("td", {}, recalledBadge(t)),
             h("td", { class: "num" }, t.initial_volume_display),
             h("td", { class: "num" }, t.remaining_display),
+            h("td", { class: "num" }, t.initial_equivalent_display),
+            h("td", { class: "num" }, t.remaining_equivalent_display),
             h(
               "td",
               { style: "min-width:220px" },
@@ -525,14 +560,16 @@ function renderIntake() {
       ? h(
           "table",
           {},
-          h("thead", {}, h("tr", {}, ["编号", "批次", "初始量 µL", "剩余 µL", "状态", "登记时间"].map((x, i) =>
-            h("th", { class: i === 2 || i === 3 ? "num" : "" }, x)))),
+          h("thead", {}, h("tr", {}, ["编号", "批次", "物态", "初始量 µL", "剩余 µL", "原样折算量剩余 µL", "状态", "登记时间"].map((x, i) =>
+            h("th", { class: i === 3 || i === 4 || i === 5 ? "num" : "" }, x)))),
           h("tbody", {}, intakeRows.map((t) =>
             h("tr", {},
               h("td", {}, h("button", { class: "btn link mono", onclick: () => openTube(t.code) }, t.code)),
               h("td", {}, t.batch || "—"),
+              h("td", {}, formBadge(t)),
               h("td", { class: "num" }, t.initial_volume_display),
               h("td", { class: "num" }, t.remaining_display),
+              h("td", { class: "num" }, t.remaining_equivalent_display),
               h("td", {}, statusBadge(t)),
               h("td", { class: "small muted" }, fmtTime(t.created_at))
             )))
@@ -624,9 +661,14 @@ function renderSplit() {
           (() => {
             const t = map.get((line.tube || "").toLowerCase());
             if (!t) return null;
-            const cls = t.status === "available" ? "help" : "help";
-            return h("div", { class: cls },
-              `当前 ${t.status === "available" ? "可用" : STATUS_BADGE[t.status][1]} · 剩余 ${t.remaining_display} µL · 组成 ${compositionText(t.composition)}` +
+            const blocked = t.is_dry;
+            return h("div", { class: blocked ? "help danger-text" : "help" },
+              `当前 ${t.status === "available" ? "可用" : STATUS_BADGE[t.status][1]} · ` +
+              (t.is_dry
+                ? "干样（体积已记账为 0，不能直接移取；请先复溶）"
+                : `剩余 ${t.remaining_display} µL`) +
+              ` · 原样折算量剩 ${t.remaining_equivalent_display} µL` +
+              ` · 组成 ${compositionText(t.composition)}` +
               (t.recalled && t.status === "available" ? " · 召回禁取样" : "")
             );
           })()
@@ -686,15 +728,22 @@ function renderSplit() {
     }, 0);
     const diff = inTotal - outTotal;
     const matches = Math.abs(diff) < 1e-9;
+    const dryPicked = inputLines.filter((l) => {
+      const t = tubesByCode().get((l.tube || "").trim().toLowerCase());
+      return t && t.is_dry;
+    });
     totalsBox.replaceChildren(
       ...[
         h("span", { class: "t-item" }, `取样合计 ${round(inTotal)} µL`),
         h("span", { class: "t-item" }, `分装合计 ${round(outTotal)} µL`),
         h("span", { class: matches ? "match" : "mismatch" }, matches ? "✓ 总量一致" : `✗ 差额 ${round(diff)} µL`),
-        h("span", { class: "muted small" }, "提交时按精确分数校验，界面小数仅供预览。"),
+        dryPicked.length
+          ? h("span", { class: "mismatch" }, `所选 ${dryPicked.map((l) => l.tube.trim()).join("、")} 是干样，不能直接取样`)
+          : null,
+        h("span", { class: "muted small" }, "取样从复溶液里带走折算量，按实测体积占比摊；界面小数仅供预览。"),
       ]
     );
-    submit.disabled = false;
+    submit.disabled = dryPicked.length > 0;
   }
 
   function round(n) {
@@ -734,6 +783,198 @@ function renderSplit() {
   return form;
 }
 
+// ------------------------------------------------------------------ 冻干 / 复溶
+
+function renderLyophilize() {
+  const selected = new Set();
+  const note = h("textarea", { placeholder: "可选：冻干批次、设备、程序…" });
+  const listBox = h("div", {});
+  const submit = h("button", { class: "btn", type: "submit" }, "冻干所选管");
+  const countLabel = h("span", { class: "muted small" });
+
+  function drawList() {
+    const rows = state.inventory.tubes.filter((t) => t.form !== "dry");
+    if (!rows.length) {
+      listBox.replaceChildren(h("div", { class: "empty" }, "没有可冻干的液体管"));
+      countLabel.textContent = "";
+      return;
+    }
+    const eligible = new Set(rows.filter((t) => t.status === "available").map((t) => t.code));
+    listBox.replaceChildren(h("table", { class: "mini-table" },
+      h("thead", {}, h("tr", {},
+        h("th", {}), h("th", {}, "编号"), h("th", {}, "批次"), h("th", {}, "状态"),
+        h("th", { class: "num" }, "剩余 µL"), h("th", { class: "num" }, "原样折算量 µL"), h("th", {}, "组成")
+      )),
+      h("tbody", {}, rows.map((t) => {
+        const ok = eligible.has(t.code);
+        return h("tr", {},
+          h("td", {}, h("input", {
+            type: "checkbox",
+            disabled: !ok,
+            checked: selected.has(t.code),
+            onchange: (e) => {
+              if (e.target.checked) selected.add(t.code); else selected.delete(t.code);
+              updateCount();
+            },
+          })),
+          h("td", { class: "mono" }, t.code),
+          h("td", {}, t.batch || "—"),
+          h("td", {}, statusBadge(t)),
+          h("td", { class: "num" }, t.remaining_display),
+          h("td", { class: "num" }, t.remaining_equivalent_display),
+          h("td", { class: "small" }, compositionText(t.composition))
+        );
+      }))
+    ));
+    updateCount();
+  }
+
+  function updateCount() {
+    countLabel.textContent = `已选 ${selected.size} 管`;
+    submit.disabled = selected.size === 0;
+  }
+
+  drawList();
+
+  const form = h("form", { class: "panel" },
+    h("div", { class: "panel-head" },
+      h("h2", {}, "冻干保存"),
+      h("p", { class: "hint" },
+        "液体管冻干成干样：体积账归零但仍在库、仍可追溯；原样折算量原样保留，干样不能直接移取。"
+      ),
+      h("span", { style: "flex:1" }),
+      countLabel
+    ),
+    listBox,
+    h("label", { class: "field", style: "margin-top:12px" }, h("span", {}, "备注"), note),
+    h("div", { class: "row" }, h("div", {}), submit)
+  );
+
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    if (!selected.size) {
+      toast("请先勾选要冻干的管", "warn");
+      return;
+    }
+    submit.disabled = true;
+    try {
+      const result = await api("/api/lyophilize", {
+        method: "POST",
+        body: { tubes: [...selected], note: note.value },
+      });
+      toast(`操作 #${result.id} 已冻干 ${result.processing.length} 管`);
+      await render();
+    } catch (err) {
+      showError(err, "冻干未提交");
+    } finally {
+      submit.disabled = false;
+    }
+  });
+
+  return form;
+}
+
+function renderReconstitute() {
+  const lines = [];
+  const note = h("textarea", { placeholder: "可选：溶剂、温度、操作人…" });
+  const listBox = h("div", {});
+  const submit = h("button", { class: "btn", type: "submit" }, "复溶所选干样");
+
+  function drawList() {
+    const dry = state.inventory.tubes.filter((t) => t.is_dry);
+    for (const line of lines) {
+      const t = dry.find((x) => x.code.toLowerCase() === line.tube.trim().toLowerCase());
+      if (t && line.volume === "") line.volume = String(t.remaining_equivalent_display);
+    }
+    if (!dry.length) {
+      listBox.replaceChildren(h("div", { class: "empty" }, "当前没有干样"));
+      submit.disabled = true;
+      return;
+    }
+    listBox.replaceChildren(h("table", { class: "mini-table" },
+      h("thead", {}, h("tr", {},
+        h("th", {}), h("th", {}, "干样"), h("th", {}, "状态"), h("th", { class: "num" }, "原样折算量 µL"),
+        h("th", {}, "实际加液体积 µL（实测）"), h("th", {}, "组成")
+      )),
+      h("tbody", {}, dry.map((t) => {
+        const line = lines.find((l) => l.tube.trim().toLowerCase() === t.code.toLowerCase());
+        const checked = Boolean(line);
+        const ok = t.status === "available";
+        return h("tr", {},
+          h("td", {}, h("input", {
+            type: "checkbox",
+            disabled: !ok,
+            checked,
+            onchange: (e) => {
+              if (e.target.checked) lines.push({ tube: t.code, volume: "" });
+              else {
+                const i = lines.findIndex((l) => l.tube.trim().toLowerCase() === t.code.toLowerCase());
+                if (i >= 0) lines.splice(i, 1);
+              }
+              drawList();
+            },
+          })),
+          h("td", { class: "mono" }, t.code),
+          h("td", {}, statusBadge(t)),
+          h("td", { class: "num" }, t.remaining_equivalent_display),
+          h("td", {}, checked
+            ? h("input", {
+                type: "text",
+                value: line.volume,
+                placeholder: "如 500 或 1/2",
+                oninput: (e) => { line.volume = e.target.value; },
+              })
+            : h("span", { class: "muted" }, "—")),
+          h("td", { class: "small" }, compositionText(t.composition))
+        );
+      }))
+    ));
+    submit.disabled = lines.length === 0;
+  }
+
+  drawList();
+
+  const form = h("form", { class: "panel" },
+    h("div", { class: "panel-head" },
+      h("h2", {}, "空白溶剂复溶"),
+      h("p", { class: "hint" },
+        "用空白溶剂复溶干样，按实测体积记账；原样折算量不因加空白溶剂而改变，后续取样按实测体积占比带走折算量。"
+      )
+    ),
+    listBox,
+    h("label", { class: "field", style: "margin-top:12px" }, h("span", {}, "备注"), note),
+    h("div", { class: "row" }, h("div", {}), submit)
+  );
+
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const tubes = lines.map((l) => ({ tube: l.tube.trim(), volume: String(l.volume).trim() }));
+    if (!tubes.length) {
+      toast("请先勾选要复溶的干样", "warn");
+      return;
+    }
+    if (tubes.some((x) => !x.volume)) {
+      toast("每支干样都要填实测复溶体积", "warn");
+      return;
+    }
+    submit.disabled = true;
+    try {
+      const result = await api("/api/reconstitute", {
+        method: "POST",
+        body: { tubes, note: note.value },
+      });
+      toast(`操作 #${result.id} 已复溶 ${result.processing.length} 管`);
+      await render();
+    } catch (err) {
+      showError(err, "复溶未提交");
+    } finally {
+      submit.disabled = false;
+    }
+  });
+
+  return form;
+}
+
 // ------------------------------------------------------------------ 报废
 
 function renderRetire() {
@@ -750,8 +991,8 @@ function renderRetire() {
     }
     listBox.replaceChildren(h("table", { class: "mini-table" },
       h("thead", {}, h("tr", {},
-        h("th", {}), h("th", {}, "编号"), h("th", {}, "类型"), h("th", {}, "批次"),
-        h("th", {}, "状态"), h("th", { class: "num" }, "剩余 µL"), h("th", {}, "组成")
+        h("th", {}), h("th", {}, "编号"), h("th", {}, "类型"), h("th", {}, "批次"), h("th", {}, "物态"),
+        h("th", {}, "状态"), h("th", { class: "num" }, "剩余 µL"), h("th", { class: "num" }, "折算量剩余 µL"), h("th", {}, "组成")
       )),
       h("tbody", {}, rows.map((t) =>
         h("tr", {},
@@ -767,8 +1008,10 @@ function renderRetire() {
           h("td", { class: "mono" }, t.code),
           h("td", {}, t.kind === "intake" ? "来样" : "分装/混合"),
           h("td", {}, t.batch || "—"),
+          h("td", {}, formBadge(t)),
           h("td", {}, statusBadge(t)),
           h("td", { class: "num" }, t.remaining_display),
+          h("td", { class: "num" }, t.remaining_equivalent_display),
           h("td", { class: "small" }, compositionText(t.composition))
         )))
     ));
@@ -837,27 +1080,31 @@ function renderRecall() {
     try {
       const data = await api(`/api/batch?batch=${encodeURIComponent(batch)}`);
       const inStock = data.tubes.filter((t) => t.status === "available");
+      const dryCount = inStock.filter((t) => t.is_dry).length;
       previewBox.replaceChildren(
         h("div", { class: `alert ${inStock.length ? "warn" : "info"}` },
           inStock.length
-            ? `批次 ${data.batch} 当前有 ${inStock.length} 管在库且含该来样，将被标记禁取样。`
+            ? `批次 ${data.batch} 当前有 ${inStock.length} 管在库且含该来样，将被标记禁取样` +
+              (dryCount ? `（其中 ${dryCount} 管为干样，召回同样涵盖，禁止复溶）` : "") + "。"
             : `批次 ${data.batch} 当前没有仍在库的受影响管；召回记录仍会保存。`
         ),
         h("table", { class: "mini-table" },
           h("thead", {}, h("tr", {},
-            h("th", {}, "受影响管"), h("th", {}, "状态"), h("th", { class: "num" }, "剩余 µL"),
-            h("th", {}, "该批占比"), h("th", {}, "组成")
+            h("th", {}, "受影响管"), h("th", {}, "物态"), h("th", {}, "状态"), h("th", { class: "num" }, "剩余 µL"),
+            h("th", { class: "num" }, "折算量剩余 µL"), h("th", {}, "该批占比"), h("th", {}, "组成")
           )),
           h("tbody", {}, inStock.length
             ? inStock.map((t) =>
                 h("tr", {},
                   h("td", { class: "mono" }, t.code),
+                  h("td", {}, formBadge(t)),
                   h("td", {}, statusBadge(t)),
                   h("td", { class: "num" }, t.batch_amount_remaining_display),
+                  h("td", { class: "num" }, t.batch_equivalent_remaining_display),
                   h("td", { class: "num" }, `${t.batch_share_percent}%`),
                   h("td", { class: "small" }, compositionText(t.composition))
                 ))
-            : h("tr", {}, h("td", { colspan: "5", class: "muted" }, "无")))
+            : h("tr", {}, h("td", { colspan: "7", class: "muted" }, "无")))
         )
       );
       submit.disabled = inStock.length === 0;
@@ -919,14 +1166,18 @@ function renderRecall() {
             r.affected.length
               ? h("table", { class: "mini-table" },
                   h("thead", {}, h("tr", {},
-                    h("th", {}, "管"), h("th", {}, "当时剩余 µL"), h("th", {}, "当时组成"),
-                    h("th", {}, "当前状态"), h("th", {}, "当前剩余 µL")
+                    h("th", {}, "管"), h("th", {}, "当时物态"), h("th", {}, "当时剩余 µL"),
+                    h("th", {}, "当时折算量 µL"), h("th", {}, "当时组成"),
+                    h("th", {}, "当前物态"), h("th", {}, "当前状态"), h("th", {}, "当前剩余 µL")
                   )),
                   h("tbody", {}, r.affected.map((a) =>
                     h("tr", {},
                       h("td", { class: "mono" }, a.code),
+                      h("td", {}, a.form === "dry" ? h("span", { class: "badge dry" }, "干样") : h("span", { class: "badge neutral" }, "液体")),
                       h("td", { class: "num" }, a.remaining_display),
+                      h("td", { class: "num" }, a.equivalent_display),
                       h("td", { class: "small" }, compositionText(a.composition)),
+                      h("td", {}, a.current_form === "dry" ? h("span", { class: "badge dry" }, "干样") : a.current_form === "liquid" ? h("span", { class: "badge neutral" }, "液体") : "—"),
                       h("td", {}, h("span", { class: "badge neutral" }, a.current_status === "available" ? "仍在库" : a.current_status === "retired" ? "已报废" : a.current_status === "exhausted" ? "已用尽" : a.current_status)),
                       h("td", { class: "num" }, a.current_remaining_display ?? "—")
                     )))
@@ -1002,8 +1253,11 @@ function renderTubeTrace(data) {
         isIntake
           ? h("span", { class: "badge neutral" }, `来样 ${node.batch || ""}`)
           : h("span", { class: "badge info" }, "混合/分装"),
+        formBadge(node),
         node.amount_taken
-          ? h("span", { class: "small muted" }, `本次取用 ${node.amount_taken_display} µL`)
+          ? h("span", { class: "small muted" },
+              `本次取用 ${node.amount_taken_display} µL` +
+              (node.equivalent_taken_display ? ` · 折算量 ${node.equivalent_taken_display} µL` : ""))
           : null,
         h("span", {}, statusBadge(node)),
         h("span", { class: "small muted" }, compositionText(node.composition))
@@ -1019,17 +1273,24 @@ function renderTubeTrace(data) {
       h("div", { class: "panel-head" },
         h("h2", {}, `管 ${t.code}`),
         h("span", { class: "badge " + (t.kind === "intake" ? "neutral" : "info") }, t.kind === "intake" ? "来样" : "分装/混合"),
+        formBadge(t),
         h("span", {}, statusBadge(t)),
         recalledBadge(t),
         h("span", { class: "muted small" }, `建立于操作 #${t.created_op} · ${fmtTime(t.created_at)}`)
       ),
       h("dl", { class: "kv", style: "margin-bottom:14px" },
         h("dt", {}, "初始量"), h("dd", {}, `${t.initial_volume_display} µL`),
-        h("dt", {}, "剩余量"), h("dd", {}, `${t.remaining_display} µL`),
+        h("dt", {}, "剩余量"), h("dd", {}, t.is_dry
+          ? `${t.remaining_display} µL（干样，体积已记账为 0，需复溶后才能移取）`
+          : `${t.remaining_display} µL`),
+        h("dt", {}, "原样折算量"), h("dd", {},
+          `初始 ${t.initial_equivalent_display} µL · 剩余 ${t.remaining_equivalent_display} µL`),
         t.batch ? h("dt", {}, "来样批次") : null,
         t.batch ? h("dd", {}, t.batch) : null,
         t.status === "retired" ? h("dt", {}, "报废") : null,
-        t.status === "retired" ? h("dd", {}, `操作 #${t.retired_op} · 废弃 ${t.discarded_display} µL · ${fmtTime(t.retired_at)}`) : null,
+        t.status === "retired" ? h("dd", {},
+          `操作 #${t.retired_op} · 废弃 ${t.discarded_display} µL` +
+          `（折算量 ${t.discarded_equivalent_display} µL）· ${fmtTime(t.retired_at)}`) : null,
         h("dt", {}, "备注"), h("dd", {}, t.note || "—")
       ),
       h("div", { class: "section-title" }, "组成（来自哪些来样）"),
@@ -1037,7 +1298,8 @@ function renderTubeTrace(data) {
       h("table", { class: "mini-table", style: "margin-top:10px" },
         h("thead", {}, h("tr", {},
           h("th", {}, "来样批次"), h("th", {}, "来样管"), h("th", { class: "num" }, "占比"),
-          h("th", { class: "num" }, "折合初始量 µL"), h("th", { class: "num" }, "折合剩余量 µL")
+          h("th", { class: "num" }, "折合初始量 µL"), h("th", { class: "num" }, "折合剩余量 µL"),
+          h("th", { class: "num" }, "折算量剩余 µL")
         )),
         h("tbody", {}, data.composition.map((c) =>
           h("tr", {},
@@ -1045,13 +1307,34 @@ function renderTubeTrace(data) {
             h("td", {}, h("button", { class: "btn link mono", onclick: () => openTube(c.intake_code) }, c.intake_code)),
             h("td", { class: "num" }, `${c.percent}%`),
             h("td", { class: "num" }, c.amount_in_initial_display),
-            h("td", { class: "num" }, c.amount_in_remaining_display)
+            h("td", { class: "num" }, c.amount_in_remaining_display),
+            h("td", { class: "num" }, c.equivalent_in_remaining_display)
           )))
-      )
+      ),
+      data.processing && data.processing.length
+        ? h("div", {},
+            h("div", { class: "section-title" }, "冻干 / 复溶处理记录"),
+            h("table", { class: "mini-table" },
+              h("thead", {}, h("tr", {},
+                h("th", {}, "操作"), h("th", {}, "时间"), h("th", {}, "处理"),
+                h("th", {}, "处理前"), h("th", {}, "处理后"), h("th", { class: "num" }, "折算量（前后不变）")
+              )),
+              h("tbody", {}, data.processing.map((p) =>
+                h("tr", {},
+                  h("td", {}, `#${p.op_id}`),
+                  h("td", { class: "small muted" }, fmtTime(p.created_at)),
+                  h("td", {}, h("span", { class: `badge ${p.action === "dry" ? "dry" : "info"}` }, p.action === "dry" ? "冻干" : "复溶")),
+                  h("td", { class: "small" }, `${p.form_before === "dry" ? "干样" : "液体"} · ${p.volume_before_display} µL`),
+                  h("td", { class: "small" }, `${p.form_after === "dry" ? "干样" : "液体"} · ${p.volume_after_display} µL`),
+                  h("td", { class: "num" }, p.equivalent_after_display)
+                )))
+            )
+          )
+        : null
     ),
     h("div", { class: "grid two" },
       h("div", { class: "panel" },
-        h("div", { class: "panel-head" }, h("h2", {}, "来源链"), h("span", { class: "hint" }, "这管由哪些管、按多少量混合而来。")),
+        h("div", { class: "panel-head" }, h("h2", {}, "来源链"), h("span", { class: "hint" }, "这管由哪些管、按多少量混合而来；干样会标注物态。")),
         h("ul", { class: "timeline" }, lineageTree(data.lineage))
       ),
       h("div", { class: "panel" },
@@ -1060,15 +1343,20 @@ function renderTubeTrace(data) {
           ? h("ul", { class: "timeline" }, data.used_in.map((u) =>
               h("li", {},
                 h("div", {}, h("strong", {}, `操作 #${u.op_id}`), " ", h("span", { class: "badge neutral" }, u.kind === "split" ? "取样/分装" : u.kind === "retire" ? "报废" : u.kind)),
-                h("div", { class: "small muted" }, `${fmtTime(u.created_at)} · 取用 ${u.amount_display} µL`),
+                h("div", { class: "small muted" },
+                  `${fmtTime(u.created_at)} · 取用 ${u.amount_display} µL` +
+                  (u.equivalent_display ? ` · 带走折算量 ${u.equivalent_display} µL` : "")),
                 u.outputs.length
-                  ? h("div", { class: "small" }, "→ " + u.outputs.map((o) => `${o.code}（${o.amount_display} µL）`).join("、"))
+                  ? h("div", { class: "small" }, "→ " + u.outputs.map((o) =>
+                      `${o.code}（${o.amount_display} µL` +
+                      (o.equivalent_display ? `，折算量 ${o.equivalent_display} µL` : "") + "）").join("、"))
                   : null
               )))
           : h("div", { class: "empty" }, "尚未被取用"),
         data.retired_at.length
           ? h("div", { class: "alert warn", style: "margin-top:12px" },
-              data.retired_at.map((r) => `操作 #${r.op_id} 报废，废弃 ${r.discarded_display} µL（${fmtTime(r.created_at)}）`).join("；"))
+              data.retired_at.map((r) =>
+                `操作 #${r.op_id} 报废（${r.form === "dry" ? "干样" : "液体"}），废弃 ${r.discarded_display} µL、折算量 ${r.discarded_equivalent_display} µL（${fmtTime(r.created_at)}）`).join("；"))
           : null
       )
     )
@@ -1086,15 +1374,17 @@ function renderBatchTrace(data) {
       ),
       h("table", { class: "mini-table" },
         h("thead", {}, h("tr", {},
-          h("th", {}, "来样管"), h("th", {}, "状态"), h("th", { class: "num" }, "初始 µL"),
-          h("th", { class: "num" }, "剩余 µL"), h("th", {}, "登记时间")
+          h("th", {}, "来样管"), h("th", {}, "物态"), h("th", {}, "状态"), h("th", { class: "num" }, "初始 µL"),
+          h("th", { class: "num" }, "剩余 µL"), h("th", { class: "num" }, "原样折算量剩余 µL"), h("th", {}, "登记时间")
         )),
         h("tbody", {}, data.intake_tubes.map((t) =>
           h("tr", {},
             h("td", {}, h("button", { class: "btn link mono", onclick: () => openTube(t.code) }, t.code)),
+            h("td", {}, formBadge(t)),
             h("td", {}, statusBadge(t)),
             h("td", { class: "num" }, t.initial_volume_display),
             h("td", { class: "num" }, t.remaining_display),
+            h("td", { class: "num" }, t.remaining_equivalent_display),
             h("td", { class: "small muted" }, fmtTime(t.created_at))
           )))
       )
@@ -1102,25 +1392,27 @@ function renderBatchTrace(data) {
     h("div", { class: "panel" },
       h("div", { class: "panel-head" },
         h("h2", {}, "流向的管（含此批来样的全部管）"),
-        h("span", { class: "hint" }, "“当时”为该管建立时的量，“现在”为当前（或所选历史序号）剩余。")
+        h("span", { class: "hint" }, "“当时”为该管建立时的量，“现在”为当前（或所选历史序号）剩余；折算量对冻干干样同样有效。")
       ),
       data.tubes.length
         ? h("table", {},
             h("thead", {}, h("tr", {},
-              h("th", {}, "管"), h("th", {}, "类型"), h("th", {}, "状态"), h("th", {}, "召回"),
+              h("th", {}, "管"), h("th", {}, "类型"), h("th", {}, "物态"), h("th", {}, "状态"), h("th", {}, "召回"),
               h("th", { class: "num" }, "此批占比"), h("th", { class: "num" }, "此批初始 µL"),
-              h("th", { class: "num" }, "此批剩余 µL"), h("th", { class: "num" }, "整管剩余 µL"),
-              h("th", {}, "组成")
+              h("th", { class: "num" }, "此批剩余 µL"), h("th", { class: "num" }, "此批折算量剩余 µL"),
+              h("th", { class: "num" }, "整管剩余 µL"), h("th", {}, "组成")
             )),
             h("tbody", {}, data.tubes.map((t) =>
               h("tr", {},
                 h("td", {}, h("button", { class: "btn link mono", onclick: () => openTube(t.code) }, t.code)),
                 h("td", {}, t.kind === "intake" ? h("span", { class: "badge neutral" }, "来样") : h("span", { class: "badge info" }, "分装/混合")),
+                h("td", {}, formBadge(t)),
                 h("td", {}, statusBadge(t)),
                 h("td", {}, recalledBadge(t)),
                 h("td", { class: "num" }, `${t.batch_share_percent}%`),
                 h("td", { class: "num" }, t.batch_amount_initial_display),
                 h("td", { class: "num" }, t.batch_amount_remaining_display),
+                h("td", { class: "num" }, t.batch_equivalent_remaining_display),
                 h("td", { class: "num" }, t.remaining_display),
                 h("td", { class: "small" }, compositionText(t.composition))
               )))
@@ -1139,22 +1431,17 @@ function renderBatchTrace(data) {
 // ------------------------------------------------------------------ 操作历史
 
 function OperationCard(op) {
-  const kindLabel = {
-    intake: ["neutral", "来样登记"],
-    split: ["info", "取样 / 分装"],
-    retire: ["warn", "报废"],
-    recall: ["danger", "召回"],
-  }[op.kind] || ["neutral", op.kind];
-  const [cls, label] = kindLabel;
+  const [cls, label] = operationLabel(op.kind);
 
   const inputList = op.inputs.length
     ? h("table", { class: "mini-table" },
-        h("thead", {}, h("tr", {}, h("th", {}, "取样管"), h("th", {}, "批次"), h("th", { class: "num" }, "取用量 µL"), h("th", { class: "num" }, "占比"))),
+        h("thead", {}, h("tr", {}, h("th", {}, "取样管"), h("th", {}, "批次"), h("th", { class: "num" }, "取用量 µL"), h("th", { class: "num" }, "带走折算量 µL"), h("th", { class: "num" }, "占比"))),
         h("tbody", {}, op.inputs.map((i) =>
           h("tr", {},
             h("td", { class: "mono" }, i.code),
             h("td", {}, i.batch || "—"),
             h("td", { class: "num" }, i.amount_display),
+            h("td", { class: "num" }, i.equivalent_display ?? "—"),
             h("td", { class: "num" }, (op.input_total_map && op.input_total_map[i.tube_id]?.share_percent) ? op.input_total_map[i.tube_id].share_percent + "%" : "—")
           )))
       )
@@ -1166,17 +1453,36 @@ function OperationCard(op) {
         h("thead", {}, h("tr", {},
           h("th", {}, isIntake ? "来样管" : "成品管"),
           h("th", { class: "num" }, isIntake ? "登记量 µL" : "分装量 µL"),
-          h("th", {}, isIntake ? "批次" : "逐管实际来源")
+          h("th", { class: "num" }, "折算量 µL"),
+          h("th", {}, isIntake ? "批次" : "逐管实际来源（体积 / 折算量）")
         )),
         h("tbody", {}, op.outputs.map((o) =>
           h("tr", {},
             h("td", { class: "mono" }, o.code),
             h("td", { class: "num" }, o.amount_display),
+            h("td", { class: "num" }, o.equivalent_display ?? "—"),
             h("td", { class: "small" }, isIntake
               ? (o.batch || "—")
               : (o.sources && o.sources.length
-                  ? o.sources.map((s) => `${s.code}: ${s.amount_display} µL（${s.share_percent}%）`).join("；")
+                  ? o.sources.map((s) => `${s.code}: ${s.amount_display} µL / ${s.equivalent_display} µL（${s.share_percent}%）`).join("；")
                   : "—"))
+          )))
+      )
+    : null;
+
+  const processingList = op.processing && op.processing.length
+    ? h("table", { class: "mini-table" },
+        h("thead", {}, h("tr", {},
+          h("th", {}, "管"), h("th", {}, "处理"), h("th", {}, "处理前"),
+          h("th", {}, "处理后"), h("th", { class: "num" }, "折算量（前后不变）")
+        )),
+        h("tbody", {}, op.processing.map((p) =>
+          h("tr", {},
+            h("td", { class: "mono" }, p.code),
+            h("td", {}, h("span", { class: `badge ${p.action === "dry" ? "dry" : "info"}` }, p.action === "dry" ? "冻干" : "复溶")),
+            h("td", { class: "small" }, `${p.form_before === "dry" ? "干样" : "液体"} · ${p.volume_before_display} µL`),
+            h("td", { class: "small" }, `${p.form_after === "dry" ? "干样" : "液体"} · ${p.volume_after_display} µL`),
+            h("td", { class: "num" }, p.equivalent_after_display)
           )))
       )
     : null;
@@ -1187,7 +1493,7 @@ function OperationCard(op) {
       h("span", { class: `badge ${cls}` }, label),
       h("span", { class: "muted small" }, fmtTime(op.created_at)),
       op.kind === "split"
-        ? h("span", { class: "small muted" }, `取样 ${op.total_in_display} µL = 分装 ${op.total_out_display} µL`)
+        ? h("span", { class: "small muted" }, `取样 ${op.total_in_display} µL = 分装 ${op.total_out_display} µL · 折算量 ${op.total_equivalent_in_display} = ${op.total_equivalent_out_display}`)
         : null,
       h("span", { style: "flex:1" }),
       h("button", {
@@ -1204,17 +1510,19 @@ function OperationCard(op) {
     ),
     op.note ? h("p", { class: "small muted", style: "margin:4px 0" }, op.note) : null,
     op.retired && op.retired.length
-      ? h("p", { class: "small" }, "报废：" + op.retired.map((r) => `${r.code}（废弃 ${r.discarded_display} µL）`).join("、"))
+      ? h("p", { class: "small" }, "报废：" + op.retired.map((r) =>
+          `${r.code}（${r.form === "dry" ? "干样" : "液体"} · 废弃 ${r.discarded_display} µL / 折算量 ${r.discarded_equivalent_display} µL）`).join("、"))
       : null,
     op.recall
       ? h("p", { class: "small" },
           `召回批次 ${op.recall.batch}，当时受影响 ${op.recall.affected_count} 管：` +
           (op.recall.affected.length
-            ? op.recall.affected.map((a) => `${a.code}（剩 ${a.remaining_display} µL）`).join("、")
+            ? op.recall.affected.map((a) => `${a.code}（${a.form === "dry" ? "干样" : "液体"} · 剩 ${a.remaining_display} µL / 折算量 ${a.equivalent_display} µL）`).join("、")
             : "无"))
       : null,
     inputList,
-    outputList
+    outputList,
+    processingList
   );
 }
 
